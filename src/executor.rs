@@ -3,8 +3,8 @@ use crate::lexer::{TknSpan, Tkn};
 use crate::{AS_SUBSHELL, RL_EDITOR, is_debug, exit_shell};
 use serde::{Deserialize, Serialize};
 use std::collections::{VecDeque, HashMap};
-use std::process::{Command, ExitStatus, Stdio, };
-use std::process;
+use std::process::{self, Command, ExitStatus, Stdio, };
+use std::borrow::Cow;
 use std::fs::{File, OpenOptions, };
 use std::io::{Write, self, PipeReader, PipeWriter, Read};
 use std::env;
@@ -31,10 +31,10 @@ pub fn get_builtins() -> &'static HashMap<&'static str, BuiltinFn> {
 
 #[derive(Serialize, Deserialize, )]
 pub enum Redir {
-    In,
-    Out,
-    Append,
-    Heredoc,
+    In, //<
+    Out,//>
+    Append, //>>
+    Heredoc,//<<
 }
 
 #[derive(Serialize, Deserialize, )]
@@ -46,8 +46,8 @@ pub struct Redirect {
 #[derive(Serialize, Deserialize)]
 pub struct Builtin<'a> { //built in command 
     #[serde(borrow)]
-    pub args: Vec<&'a str>,
-    //I/O streams for redirection
+    pub args: Vec<Cow<'a, str>>,
+    // I/O streams for redirection
     pub redirect_ins: Vec<Redirect>,
     pub redirect_outs: Vec<Redirect>,
 }
@@ -55,8 +55,10 @@ pub struct Builtin<'a> { //built in command
 impl<'a> Builtin<'a> {
     pub fn exec_builtin(&mut self, pipe_write: Option<PipeWriter>, pipe_read: Option<PipeReader>)
     -> anyhow::Result<()> {
-        let builtin_fn = get_builtins().get(self.args[0]).unwrap(); //unwrap safe because parser checks if in builtins
-        match builtin_fn(&self.args, pipe_read) {
+        expand_quotes(&mut self.args);
+        let cleaned_asref: Vec<&str> = self.args.iter().map(|arg| arg.as_ref()).collect();
+        let builtin_fn = get_builtins().get(cleaned_asref[0]).unwrap(); //unwrap safe because parser checks if in builtins
+        match builtin_fn(&cleaned_asref, pipe_read) {
             Ok(output_str) => {
                 if !self.redirect_outs.is_empty() {
                     let redirects = mem::take(&mut self.redirect_outs);
@@ -79,12 +81,10 @@ impl<'a> Builtin<'a> {
 #[derive(Serialize, Deserialize)]
 pub struct ChildPr<'a> { //a child process spawned by shell
     #[serde(borrow)]
-    pub args: Vec<&'a str>,
-    //I/O streams for redirection
+    pub args: Vec<Cow<'a, str>>,
+    // I/O streams for redirection
     pub redirect_ins: Vec<Redirect>,
     pub redirect_outs: Vec<Redirect>,
-
-    pub prog_name: &'a str,
 }
 
 impl<'a> ChildPr<'a> {
@@ -93,9 +93,11 @@ impl<'a> ChildPr<'a> {
         if !self.redirect_ins.is_empty() { stdin = Stdio::piped(); }
         if !self.redirect_outs.is_empty() { stdout = Stdio::piped(); }
         
-        let mut handle = Command::new(self.args[0]);
-        if self.args.len() > 1 {
-            handle.args(&self.args[1..]); 
+        expand_quotes(&mut self.args);
+        let cleaned_asref: Vec<&str> = self.args.iter().map(|arg| arg.as_ref()).collect();
+        let mut handle = Command::new(cleaned_asref[0]);
+        if cleaned_asref.len() > 1 {
+            handle.args(&cleaned_asref[1..]); 
         }
         handle.stdin(stdin);
         handle.stdout(stdout);
@@ -123,6 +125,7 @@ impl<'a> ChildPr<'a> {
                             let _ = stdin_handle.write_all((&r.file).as_bytes());
                         },
                         Redir::In => {
+                            if !Path::new(&r.file).is_file() { anyhow::bail!("ERR: {} is not a valid file", r.file); }
                             if let Ok(mut f) = File::open(&r.file) {
                                 //write to child stdin in chunks until f's eof
                                 let _ = std::io::copy(&mut f, &mut stdin_handle);
@@ -131,6 +134,7 @@ impl<'a> ChildPr<'a> {
                         _ => (),
                     }
                 }
+                Ok(())
             });
         }
         if !self.redirect_outs.is_empty() {
@@ -192,6 +196,7 @@ impl<'a> Subsh<'a> {
             AstNode::Builtin(builtin) => builtin.redirect_ins.extend(redirects),
             AstNode::Logical{ lhs,..} => self.apply_redirect_in(redirects, lhs)?,
             AstNode::Pipeline(pipeline) => self.apply_redirect_in(redirects, &mut pipeline[0])?,
+            AstNode::Assignment{ .. } => todo!(),
         }
         Ok(())
     }
@@ -277,6 +282,9 @@ fn spawn_pipeline(progs: &mut Vec<Box<AstNode>>) -> anyhow::Result<Vec<process::
 
                 children.push(subsh.spawn(c_stdin, c_stdout)?);
             },
+            AstNode::Assignment{ lhs, rhs } => {
+                todo!();
+            }
             _ => anyhow::bail!("unreachable, pipe can only have Prog or Subshell"),
         }
         cur_pipe_read = next_pipe_read;
@@ -340,6 +348,9 @@ fn dfs(node: &mut Box<AstNode>) -> anyhow::Result<i32> {
                 .code()
                 .unwrap_or(1));
         },
+        AstNode::Assignment{ lhs, rhs } => {
+            todo!();
+        }
     }
 }
 
@@ -355,6 +366,70 @@ pub fn execute_ast(mut executables: Vec<Box<AstNode>>) -> anyhow::Result<i32> {
         res = dfs(ast)?;
     }
     Ok(res)
+}
+
+//evaluate quoted strings in args
+fn expand_quotes<'a>(args: &mut Vec<Cow<'a, str>>) {
+    for i in 0..args.len() {
+        let arg = args[i].as_ref();
+        if needs_escape(arg) {
+            args[i] = Cow::Owned(escape(arg));
+        } 
+    }
+}
+
+pub fn needs_escape(arg: &str) -> bool { 
+    arg.starts_with("\"") || arg.starts_with("'") 
+}
+
+//evaluates a quoted string
+pub fn escape(arg: &str) -> String {
+    if arg.len() < 2 {
+        return arg.to_string();
+    }
+
+    //get opening quote (' or " or `)
+    let quote = arg.chars().nth(0).unwrap();
+    //lexer guarantees that all quoted strings are properly formatted, so this should be safe
+    let inner_str = &arg[1..arg.len()-1];
+    // Single quotes are literal; no escaping happens inside them.
+    if quote == '\'' {
+        return inner_str.to_string();
+    }
+
+    // Double quotes require escape processing.
+    let mut owned = String::with_capacity(inner_str.len());
+    let mut in_escape = false;
+    for c in inner_str.chars() {
+        if in_escape {
+            match c {
+                'n' => owned.push('\n'),
+                't' => owned.push('\t'),
+                'r' => owned.push('\r'),
+                '\\' => owned.push('\\'),
+                '"' => owned.push('"'),
+                '`' => owned.push('`'),
+                '$' => owned.push('$'),
+                // POSIX Shell Rule: If a backslash precedes a character that 
+                // doesn't have a special meaning, both the backslash and the character are preserved.
+                _ => {
+                    owned.push('\\');
+                    owned.push(c);
+                }
+            }
+            in_escape = false;
+        } else if c == '\\' {
+            in_escape = true;
+        } else {
+            owned.push(c);
+        }
+    }
+
+    // If the string ended with an unclosed backslash, preserve it
+    if in_escape {
+        owned.push('\\');
+    }
+    owned
 }
 
 /* BUILTINS */
@@ -403,11 +478,11 @@ fn get_history(args: &[&str], _pipe_reader: Option<PipeReader>) -> anyhow::Resul
             _ => anyhow::bail!("unrecognized history parameter {}", args[1]),
         };
     }
-    let hist_len = RL_EDITOR.with_borrow(|h| h.history().len());
+    let hist_len = RL_EDITOR.with_borrow(|h| h.history().len()) as i32;
     let start = std::cmp::max(0, hist_len - 15);
     for i in start..hist_len {
         RL_EDITOR.with_borrow(|rl| {
-            let entry = rl.history().get(i, SearchDirection::Forward).unwrap().unwrap().entry;
+            let entry = rl.history().get(i as usize, SearchDirection::Forward).unwrap().unwrap().entry;
             if i != hist_len - 1 {
                 output.push_str(&format!("{}\n", entry));
             } else {

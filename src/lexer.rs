@@ -1,4 +1,5 @@
 use crate::is_debug;
+use crate::executor::escape;
 
 use logos::{Logos, Lexer, SpannedIter };
 use std::collections::VecDeque;
@@ -37,7 +38,7 @@ impl LexerState {
 #[logos(extras = LexerState)]
 #[logos(skip r#"[ \t\f]+"#)]
 pub enum Tkn {
-    #[regex(r#"[^ `"'\\\t\f\n|&;<>(){}]+"#)]
+    #[regex(r#"[^ `"'\\\t\f\n|&;<>(){}=]+"#)]
     Word,
 
     #[token("<", redirect_callback)]
@@ -71,7 +72,10 @@ pub enum Tkn {
     And,
 
     #[regex(r#"[`'"]"#, quote_handler)]
-    Quote(String),
+    Quote,
+
+    #[token("=")]
+    Assign,
 
     #[token("(", bracket_callback)]
     LParen,
@@ -81,6 +85,9 @@ pub enum Tkn {
 
     #[token("\n", newline_handler)]
     Newline,
+
+    #[token(r#"[ \t\f]+"#)]
+    Space,
 }
 
 //not used for tkn generation, only for debugging/error reporting
@@ -99,10 +106,12 @@ impl fmt::Display for Tkn {
             Tkn::CmdOr => "||",
             Tkn::Semicolon => ";",
             Tkn::And => "&",
-            Tkn::Quote(content) => return write!(f, "{}", content),
+            Tkn::Quote => "quoted string",
             Tkn::LParen => "(",
             Tkn::RParen => ")",
             Tkn::Newline => "newline",
+            Tkn::Assign => "=",
+            Tkn::Space => "Space",
         };
         write!(f, "{}", s)
     }
@@ -121,7 +130,7 @@ fn redirect_callback(lex: &mut Lexer<Tkn>) -> bool {
     //does not advance lex iterator. i.e. if delim_lex finds valid filename,
     //it will be consumed as a Tkn::Word in the next lext.next() call
     match delim_lex.next() {
-        Some(Ok(TargetDelim::Delim(_)) | Ok(TargetDelim::Quote(_))) => {
+        Some(Ok(TargetDelim::Delim(_)) | Ok(TargetDelim::Quote)) => {
             //found a valid filename
             success = true;
         },
@@ -144,7 +153,7 @@ fn operator_callback(lex: &mut Lexer<Tkn>) -> Option<()> {
     //does not advance lex iterator. i.e. if delim_lex finds valid delimiter,
     //it will be consumed as a Tkn::Word in the next lext.next() call
     match delim_lex.next() {
-        Some(Ok(TargetDelim::Delim(_)) | Ok(TargetDelim::Quote(_))) => {
+        Some(Ok(TargetDelim::Delim(_)) | Ok(TargetDelim::Quote)) => {
             delim_lex.extras.continuation_for = None;
         },
         Some(Ok(TargetDelim::Newline)) => {
@@ -165,10 +174,15 @@ fn heredoc_callback(lex: &mut Lexer<Tkn>) -> bool {
     //does not advance lex iterator. i.e. if delim_lex finds valid delimiter,
     //it will be consumed as a Tkn::Word in the next lext.next() call
     match delim_lex.next() {
-        Some(Ok(TargetDelim::Delim(delim)) | Ok(TargetDelim::Quote(delim))) => {
+        Some(Ok(TargetDelim::Delim(delim))) => {
             delim_lex.extras.delimiters.push_back(delim);
             success = true;
-        },
+        }
+        Some(Ok(TargetDelim::Quote)) => {
+            let delim = escape(delim_lex.slice());
+            delim_lex.extras.delimiters.push_back(delim);
+            success = true;
+        }
         _ => {
             delim_lex.extras.syntax_err = Some("not a valid delimiter for <<".to_string());
         },
@@ -249,20 +263,18 @@ enum QuoteTkn {
     #[token("\\")]
     Escape,
 
-    #[regex(r#"[^'"`\\]+"#, |lex| lex.slice().to_string())]
-    //stop matching Text at a backslash, cuz bacsklash in quotes must escape next char
-    Text(String),
+    #[regex(r#"[^'"`\\]"#)]
+    //stop matching Text at a backslash, cuz backslash in quotes must escape next char
+    Char,
 }
 
 #[derive(Logos, Debug, PartialEq, Clone)]
 #[logos(extras = LexerState)]
 #[logos(skip r"[ \t\f]+")] // Ignore this regex pattern between token
-enum TargetDelim { //for finding valid target after one of <, >, <<, >>, ||, &&, or |
-    // A valid delimiter is 1 or more characters that are NOT 
-    // whitespace or shell operators.
-
+enum TargetDelim { //for finding valid target after one of <, >, <<, >>, ||, &&, or =
+    // A valid delimiter is 1 or more characters that are NOT whitespace or shell operators.
     #[regex(r#"['"`]"#, quote_handler)]
-    Quote(String),
+    Quote,
 
     #[token("\n")]
     Newline,
@@ -279,13 +291,20 @@ enum HeredocTkn {
     HeredocLine,
 }
 
-fn quote_handler<'a, T>(lex: &mut Lexer<'a, T>) -> Option<String> 
+// #[derive(Logos, Debug, PartialEq, Clone)]
+// #[logos(extras = LexerState)]
+// enum AssignmentTkn {
+//     //match any number of characters, ended with a newline
+//     #[regex(r#"[^]*[\n; ]"#, allow_greedy = true)]
+//     HeredocLine,
+// }
+
+fn quote_handler<'a, T>(lex: &mut Lexer<'a, T>) -> bool 
 where T: Logos<'a, Extras = LexerState, Source = str> + Clone {
     assert!(lex.extras.expected_closer.is_none());
     let mut quote_lex = lex.clone().morph::<QuoteTkn>();
     //closing quote must match the opening quote
     quote_lex.extras.expected_closer = Some(quote_lex.slice().to_string());
-    let mut content = String::new();
     while let Some(res) = quote_lex.next() {
         match res {
             Ok(QuoteTkn::PotentialCloser) => {
@@ -294,18 +313,12 @@ where T: Logos<'a, Extras = LexerState, Source = str> + Clone {
                     quote_lex.extras.expected_closer = None;
                     break;
                 }
-                content.push_str(quote);
             },
-            Ok(QuoteTkn::Text(text)) => {
-                content.push_str(&text);
-            },
+            Ok(QuoteTkn::Char) => (),
             Ok(QuoteTkn::Escape) => {
-                if Some("\'".to_string()) == quote_lex.extras.expected_closer {
-                    content.push('\\'); //backslash doesn't escape in single quotes
-                } else {
-                    if let Some(_) = quote_lex.next() {
-                        content.push_str(quote_lex.slice());
-                    }
+                if quote_lex.extras.expected_closer != Some("\'".to_string()) {
+                    //backslash doesn't escape chars in single quoted strings
+                    _ = quote_lex.next();
                 }
             }
             Err(e) => panic!("ERR: {:?}", e),
@@ -317,7 +330,7 @@ where T: Logos<'a, Extras = LexerState, Source = str> + Clone {
     lex.bump(num_read_bytes); 
 
     lex.extras = quote_lex.extras; //sync states
-    if lex.extras.expected_closer.is_none() { Some(content) } else { None }
+    lex.extras.expected_closer.is_none() 
 }
 
 pub struct TknSpan {
@@ -334,9 +347,6 @@ pub fn lex_cmd_buf<'a> (span_iter: &mut SpannedIter<'a, Tkn>, cmd_buf: &'a str) 
                 if is_debug() {
                     match tkn {
                         Tkn::Newline => println!(),
-                        Tkn::Quote(ref quote_content) => {
-                            print!("tkn: '{}'; ", quote_content);
-                        },
                         _ => print!("tkn: '{}'; ", &cmd_buf[span.start..span.end]),
                     }
                 }
@@ -366,9 +376,9 @@ pub fn lex_cmd_buf<'a> (span_iter: &mut SpannedIter<'a, Tkn>, cmd_buf: &'a str) 
 }
 
 pub fn get_token_at<'a>(tkn_span: &'a TknSpan, cmd_buf: &'a str) -> &'a str {
-    if let Tkn::Quote(ref quote_content) = tkn_span.kind {
-        return quote_content;
-    }
+    // if let Tkn::Quote(ref quote_content) = tkn_span.kind {
+    //     return quote_content;
+    // }
     &cmd_buf[tkn_span.span.start..tkn_span.span.end]
 }
 

@@ -31,16 +31,16 @@ fn get_output(cmd: &str) -> String {
 
 fn run_test(cmd: &str, expected: String) -> anyhow::Result<()> {
     //spawn the rust shell as a child process
-    println!("{}testing{} \"{}\"", CYAN, NC, cmd.trim());
+    println!("{}testing{} {}", CYAN, NC, cmd.trim());
     let mut shell = Command::new(SHELL_EXE)
         .arg("--debug")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
-    {
-        let mut shell_stdin = shell.stdin.take().expect("Failed to take shell program stdin");
-        shell_stdin.write_all(cmd.as_bytes())?;
-    }
+
+    let mut shell_stdin = shell.stdin.take().expect("Failed to take shell program stdin");
+    shell_stdin.write_all(cmd.as_bytes())?;
+    drop(shell_stdin);
 
     let res = shell.wait_with_output()?;
     assert!(res.status.success());
@@ -53,7 +53,7 @@ fn run_test(cmd: &str, expected: String) -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_basic() -> anyhow::Result<()> {
+fn basic() -> anyhow::Result<()> {
     let tests = vec![
         //(<command>, <expected output>)
         ("echo 'hello world'", "hello world".to_string()),
@@ -67,7 +67,7 @@ fn test_basic() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_builtins() -> anyhow::Result<()> {
+fn builtins() -> anyhow::Result<()> {
     //to test history, set history file to temp file. then run commands below, then run history and
     //match output
     let cwd = std::env::current_dir().unwrap();
@@ -84,7 +84,7 @@ fn test_builtins() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_pipeline() -> anyhow::Result<()> {
+fn pipelines() -> anyhow::Result<()> {
     let tests = vec![
         // Basic 2-stage pipeline
         ("cat Cargo.toml | grep dependencies", get_output("cat Cargo.toml | grep dependencies")),
@@ -109,7 +109,7 @@ fn test_pipeline() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_heredocs() -> anyhow::Result<()> {
+fn heredocs() -> anyhow::Result<()> {
     let heredoc_tests = vec![
         // Basic Heredoc
         (
@@ -151,6 +151,16 @@ fn test_heredocs() -> anyhow::Result<()> {
             "cat <<eof\nThis should work!\neof\n", 
             "This should work!".to_string()
         ),
+        //heredoc delimiter is quote
+        (
+            "cat <<'asdf'\nThis\nshould work!\nasdf\n",
+            "This\nshould work!".to_string(),
+        ),
+        //dquote
+        (
+            "cat <<\"as\\\"df\"\nHello world\nas\"df\n",
+            "Hello world".to_string(),
+        ),
     ];
     for test in heredoc_tests.into_iter() {
         run_test(test.0, test.1)?;
@@ -159,7 +169,7 @@ fn test_heredocs() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_redirects() -> anyhow::Result<()> {
+fn redirects() -> anyhow::Result<()> {
     let mut filecontent = "binturong bin\nbinder\nbingchilling";
     let mut tests: Vec<(&str, String)> = vec![
         ("echo \"binturong bin\nbinder\nbingchilling\" > temp.txt", no_output()),
@@ -222,7 +232,7 @@ fn test_redirects() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_logicals() -> anyhow::Result<()> {
+fn logicals() -> anyhow::Result<()> {
     let tests = vec![
         // Short-Circuit Success: Confirms && continues executing when the first command succeeds.
         (
@@ -267,7 +277,7 @@ fn test_logicals() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_subshells() -> anyhow::Result<()> {
+fn subshells() -> anyhow::Result<()> {
     let tests = vec![
         // Basic Subshell Isolation: Verifies a single subshell isolates commands and bubbles stdout up to the parent.
         (
@@ -300,7 +310,53 @@ fn test_subshells() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_combined_operators() -> anyhow::Result<()> {
+fn escapes() -> anyhow::Result<()> {
+    let tests = vec![
+        // Single Quotes: Literal preservation without processing backslashes or special characters
+        (
+            "echo 'hello\\nworld'\n",
+            "hello\\nworld\n".to_string(),
+        ),
+        (
+            "echo 'foo $BAR \"baz\"'\n",
+            "foo $BAR \"baz\"\n".to_string(),
+        ),
+
+        // Double Quotes: Processes standard escaped control characters (\n, \t, \r, \\, \", \`, \$)
+        (
+            "echo \"hello\\nworld\"\n",
+            "hello\nworld\n".to_string(),
+        ),
+        (
+            "echo \"tab\\ttest\\r\"\n",
+            "tab\ttest\r\n".to_string(),
+        ),
+        (
+            "echo \"escaped \\\"quotes\\\" and \\\\ backslash\"\n",
+            "escaped \"quotes\" and \\ backslash\n".to_string(),
+        ),
+
+        // POSIX Shell Fallback: Unrecognized escape sequences preserve both the backslash and character
+        (
+            "echo \"hello \\a world\"\n",
+            "hello \\a world\n".to_string(),
+        ),
+
+        // Subshell Quote Integration: Verifies escaped double quotes inside subshells deserialize and execute cleanly
+        (
+            "(echo \"inner \\\"quoted\\\" value\")\n",
+            "inner \"quoted\" value\n".to_string(),
+        ),
+    ];
+
+    for test in tests.into_iter() {
+        run_test(test.0, test.1)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn combined_operators() -> anyhow::Result<()> {
     // SETUP
     let mut error_log = File::create("errors.log")?;
     error_log.write_all(b"2026-07-19 SUCCESS: Database connected successfully.\n\
@@ -358,7 +414,7 @@ fn test_combined_operators() -> anyhow::Result<()> {
         ), 
         ("cat < file1.txt < file2.txt\n", "recovered output\nrecovered output".to_string()),
 
-        // Deep Stress Test: The Kitchen Sink
+        // The Kitchen Sink
         (
             "(grep \"ERROR\" && echo \"found errors\"\n) < system.log >> audit.log || echo \"audit failed\"\n",
             no_output()
@@ -382,16 +438,67 @@ fn test_combined_operators() -> anyhow::Result<()> {
             "echo \"data stream\" | (cat | grep \"data\" && (echo \"deep match\"))\n",
             "data stream\ndeep match".to_string()
         ),
+
+        // Deep AST Stress Test: Nested Subshell as First Program with Outer Redirections
+        // The outer subshell is redirected. Its very first AST node is an inner subshell `(grep)`.
+        // The inner subshell must transparently inherit the stdin (errors.log) and stdout (nested_test.txt) overrides from the outer shell.
+        (
+            "((grep \"ERROR\") && echo \"inner execution complete\") < errors.log > nested_test.txt\n",
+            no_output(),
+        ),
+        // VERIFICATION: Check that the outer stdout redirect caught both the output of the inner subshell AND the outer echo command.
+        (
+            "cat nested_test.txt\n",
+            "2026-07-19 ERROR: Failed to bind to interface on port 8080.\ninner execution complete\n".to_string()
+        ),
+
+        // Subshell Input/Output Redirections with Quotes
+        (
+            "(echo \"line 1\" && echo 'line 2') > test_out.txt && cat test_out.txt\n",
+            "line 1\nline 2\n".to_string(),
+        ),
+        (
+            "echo \"redirected input\" > test_in.txt && (cat < test_in.txt)\n",
+            "redirected input\n".to_string(),
+        ),
+
+        // Subshell Append Redirection with Escaped Quotes
+        (
+            "echo \"first\" > test_app.txt && (echo \"second \\\"quoted\\\"\" >> test_app.txt) && cat test_app.txt\n",
+            "first\nsecond \"quoted\"\n".to_string(),
+        ),
+
+        // Escaped Pipeline (|) inside Double Quotes vs Unescaped Pipeline
+        (
+            "echo \"arg1 | arg2\"\n",
+            "arg1 | arg2\n".to_string(),
+        ),
+        (
+            "echo \"hello world\" | (grep \"hello\")\n",
+            "hello world\n".to_string(),
+        ),
+
+        // Chained Pipelines across Subshells with Quote Escapes
+        (
+            "(echo \"foo\\nbar\" | grep \"foo\") && (echo 'baz' | grep 'baz')\n",
+            "foo\nbaz\n".to_string(),
+        ),
+
+        // Redirection Filename Containing Escaped Quotes/Spaces
+        (
+            "echo \"content\" > \"my file.txt\" && (cat < \"my file.txt\")\n",
+            "content\n".to_string(),
+        ),
     ];
 
     for test in tests.into_iter() {
         if let Err(e) = run_test(test.0, test.1) {
             // cleanup
-            let _ = Command::new("sh").arg("-c").arg("rm *.log file*.txt result.txt").status();
+            let _ = Command::new("sh").arg("-c").arg("rm *.log *.txt").status();
             anyhow::bail!(e);
         }
     }
     // cleanup
-    let _ = Command::new("sh").arg("-c").arg("rm *.log file*.txt result.txt").status();
+    let _ = Command::new("sh").arg("-c").arg("rm *.log *.txt").status();
     Ok(())
 }
