@@ -36,9 +36,8 @@ impl LexerState {
 
 #[derive(Logos, Debug, PartialEq, Clone, Serialize, Deserialize)]
 #[logos(extras = LexerState)]
-#[logos(skip r#"[ \t\f]+"#)]
 pub enum Tkn {
-    #[regex(r#"[^ `"'\\\t\f\n|&;<>(){}=]+"#)]
+    #[regex(r#"[^ `"'\\\t\f\n|&;<>(){}=$]+"#)]
     Word,
 
     #[token("<", redirect_callback)]
@@ -77,6 +76,9 @@ pub enum Tkn {
     #[token("=")]
     Assign,
 
+    #[token("$")]
+    Eval,
+
     #[token("(", bracket_callback)]
     LParen,
 
@@ -86,7 +88,7 @@ pub enum Tkn {
     #[token("\n", newline_handler)]
     Newline,
 
-    #[token(r#"[ \t\f]+"#)]
+    #[regex(r#"[ \t\f]+"#)]
     Space,
 }
 
@@ -111,6 +113,7 @@ impl fmt::Display for Tkn {
             Tkn::RParen => ")",
             Tkn::Newline => "newline",
             Tkn::Assign => "=",
+            Tkn::Eval => "$",
             Tkn::Space => "Space",
         };
         write!(f, "{}", s)
@@ -360,11 +363,15 @@ pub fn lex_cmd_buf<'a> (span_iter: &mut SpannedIter<'a, Tkn>, cmd_buf: &'a str) 
 
     if !span_iter.extras.bracket_closers.is_empty() { return None; } //unclosed paren, bracket, or curly
 
-    //check if 2nd to last tkn is an invalid operator (last is newline)
-    if let Some(tkn) = tkns.get(tkns.len()-2) { 
-        if [Tkn::Pipe, Tkn::CmdOr, Tkn::CmdAnd, ].contains(&tkn.kind) {
-            span_iter.extras.continuation_for = Some(get_token_at(tkn, cmd_buf).to_string());
-            return None;
+    //check if last non-whitespace (not space or newline) tkn is an operator 
+    for tkn in tkns.iter().rev() {
+        match tkn.kind {
+            Tkn::Space | Tkn::Newline => continue,
+            Tkn::Pipe | Tkn::CmdOr | Tkn::CmdAnd => {
+                span_iter.extras.continuation_for = Some(get_token_at(tkn, cmd_buf).to_string());
+                return None;
+            }
+            _ => break,
         }
     }
     let mut heredocs = VecDeque::with_capacity(span_iter.extras.heredocs.len());

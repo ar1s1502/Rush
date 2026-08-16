@@ -20,46 +20,57 @@ fn run_cmd(cmd_buf: &str, args: &[&str]) -> anyhow::Result<()> {
 #[test]
 fn test_lexer() -> anyhow::Result<()> {
     // 1. simple test
-    let mut tkns = vec!["echo", "hello", "world", "\n"];
-    let mut cmd_buf = tkns.join(" ");
+    let tkns = vec!["echo", " ", "hello", " ", "world", " ", "\n"];
+    let cmd_buf = "echo hello world \n".to_string();
     run_cmd(&cmd_buf, &tkns)?;
 
     // 2. mixed test with heredoc
-    tkns = vec!["asdf", "ASDFAW", "1234125", "###", "<", "iipo", ">>", "98767", "<<", "\"ghj\"", 
-        ">", "'6789'", "\nghj\n",
+    let tkns = vec![
+        "asdf", " ", "ASDFAW", " ", "1234125", " ", "###", " ", "<", " ", "iipo", " ",
+        ">>", " ", "98767", " ", "<<", " ", "\"ghj\"", " ", ">", " ", "'6789'", " ", "\nghj\n",
     ];
-    cmd_buf = "asdf ASDFAW 1234125 ### < iipo >> 98767 << \"ghj\" > '6789' \nghj\n".to_string();
+    let cmd_buf = "asdf ASDFAW 1234125 ### < iipo >> 98767 << \"ghj\" > '6789' \nghj\n".to_string();
     run_cmd(&cmd_buf, &tkns)?;
 
     // 3. string literal chaos test
-    tkns = vec!["\"678987678987 asdfas > < >> << || {} :: '' / \\ @#%\"", "\n"];
-    cmd_buf = tkns.join("");
+    let tkns = vec!["\"678987678987 asdfas > < >> << || {} :: '' / \\ @#%\"", "\n"];
+    let cmd_buf = tkns.join("");
     run_cmd(&cmd_buf, &tkns)?;
 
     // 4. Multiple sequential heredocs (cat << A << B << C)
-    tkns = vec!["cat", "<<", "A", "<<", "B", "<<", "C", "\ncontentA\nA\ncontentB\nB\ncontentC\nC\n"];
-    cmd_buf = "cat << A << B << C \ncontentA\nA\ncontentB\nB\ncontentC\nC\n".to_string();
+    let tkns = vec![
+        "cat", " ", "<<", " ", "A", " ", "<<", " ", "B", " ", "<<", " ", "C", " ",
+        "\ncontentA\nA\ncontentB\nB\ncontentC\nC\n",
+    ];
+    let cmd_buf = "cat << A << B << C \ncontentA\nA\ncontentB\nB\ncontentC\nC\n".to_string();
     run_cmd(&cmd_buf, &tkns)?;
 
     // 5. Multiple heredocs separated by pipeline stages (cat << A | cat << B)
-    tkns = vec!["cat", "<<", "A", "|", "cat", "<<", "B", "\nbodyA\nA\nbodyB\nB\n"];
-    cmd_buf = "cat << A | cat << B \nbodyA\nA\nbodyB\nB\n".to_string();
+    let tkns = vec![
+        "cat", " ", "<<", " ", "A", " ", "|", " ", "cat", " ", "<<", " ", "B", " ",
+        "\nbodyA\nA\nbodyB\nB\n",
+    ];
+    let cmd_buf = "cat << A | cat << B \nbodyA\nA\nbodyB\nB\n".to_string();
     run_cmd(&cmd_buf, &tkns)?;
 
     // 6. space mixup - No spaces between operator and delimiter (<<EOF)
-    tkns = vec!["cat", "<<", "EOF", "\nhello\nEOF\n"];
-    cmd_buf = "cat <<EOF\nhello\nEOF\n".to_string();
+    let tkns = vec!["cat", " ", "<<", "EOF", "\nhello\nEOF\n"];
+    let cmd_buf = "cat <<EOF\nhello\nEOF\n".to_string();
     run_cmd(&cmd_buf, &tkns)?;
 
     // 7. space mixup - Multi-space padding before delimiter (<<   EOF)
-    tkns = vec!["cat", "<<", "EOF", "\nhello spacey heredoc\nEOF\n"];
-    cmd_buf = "cat <<   EOF\nhello spacey heredoc\nEOF\n".to_string();
+    let tkns = vec!["cat", " ", "<<", "   ", "EOF", "\nhello spacey heredoc\nEOF\n"];
+    let cmd_buf = "cat <<   EOF\nhello spacey heredoc\nEOF\n".to_string();
     run_cmd(&cmd_buf, &tkns)?;
 
     // 8. space mixup - operators squished with commands
-    tkns = vec!["cat", "Cargo.toml", "|", "grep",  "c", "||", "tail", "-n", "3", "&&", "echo", "hello", "\n"];
-    cmd_buf = "cat Cargo.toml|grep c||tail -n 3&&echo hello\n".to_string();
+    let tkns = vec![
+        "cat", " ", "Cargo.toml", "|", "grep", " ", "c", "||", "tail", " ", "-n", " ",
+        "3", "&&", "echo", " ", "hello", "\n",
+    ];
+    let cmd_buf = "cat Cargo.toml|grep c||tail -n 3&&echo hello\n".to_string();
     run_cmd(&cmd_buf, &tkns)?;
+
     Ok(())
 }
 

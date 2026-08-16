@@ -1,8 +1,8 @@
 use crate::lexer::{TknSpan, Tkn, get_token_at};
-use crate::executor::{ChildPr, Builtin, Subsh, Redirect, Redir, get_builtins, escape, needs_escape};
+use crate::executor::{ChildPr, Builtin, Subsh, Redirect, Redir, Assignment, get_builtins, escape, needs_escape};
 use std::collections::VecDeque;
 use std::borrow::Cow;
-use std::iter::{Peekable};
+use std::iter::{Peekable,};
 use std::slice::Iter;
 use serde::{Deserialize, Serialize};
 use anyhow::anyhow;
@@ -18,6 +18,8 @@ pub enum AstNode<'a> {
     #[serde(borrow)]
     Prog(ChildPr<'a>),
 
+    Builtin(Builtin<'a>),
+
     Logical {
         lhs: Box<AstNode<'a>>,
         operator: Tkn,
@@ -28,12 +30,7 @@ pub enum AstNode<'a> {
 
     Subshell(Subsh<'a>),
 
-    Builtin(Builtin<'a>),
-
-    Assignment {
-        lhs: &'a str, 
-        rhs: Vec<&'a str>
-    },
+    Assignments(Vec<Assignment<'a>>), //global shell-scoped env vars
 }
 
 pub struct Parser<'a>
@@ -70,31 +67,28 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    //need a new function to handle assignments
-    //rhs of an assignment is an AstNode. 
     //goal is to create an AstNode::Assignment which the executor evaluates at runtime
-    //an assignment has a lhs, and a rhs.
-    //rhs is a vec of Tkns, for now just worry about Words and Quotes.
+    //an assignment has a lhs (a word), and a rhs (an AstNode syntax tree)
     //in the match statement in the while loop, accept words, quotes, l/rparen. anything else throw
-    //syntax error. stop at the same program delims, except also include whitespacw
-    fn assign_to(&mut self, lhs: &'a str) -> anyhow::Result<Box<AstNode<'a>>> {
+    //syntax error. stop at the same program delims, except also include whitespace
+    fn assign_to(&mut self, lhs: &'a str) -> anyhow::Result<Assignment<'a>> {
         self.eat(Tkn::Assign)?; //consume the '=' tkn
         let mut rhs = Vec::new();
-        while let Some(tkn) = self.advance() {
+        while let Some(tkn) = self.tkns.peek() {
             match tkn.kind {
                 Tkn::Word | Tkn::Quote => {
                     //quote strings expanded at execution time
-                    rhs.push(get_token_at(tkn, self.cmd_buf));
+                    rhs.push(get_token_at(self.advance().unwrap(), self.cmd_buf));
                 }
                 Tkn::Space | Tkn::Newline | Tkn::Semicolon | Tkn::CmdOr | Tkn::CmdAnd | Tkn::RParen | Tkn::Pipe => {
-                    return Ok(Box::new(AstNode::Assignment{lhs, rhs}));
+                    return Ok(Assignment{lhs, rhs, delim_kind: tkn.kind.clone()});
                 }
                 //TODO: support cmd substitution $() and arrays ()
                 _ => {
                     anyhow::bail!("Syntax ERR: {} is an invalid token for assignment", get_token_at(tkn, self.cmd_buf));
                 }
             }
-        };
+        }
         anyhow::bail!("unreachable");
     }
 
@@ -103,17 +97,23 @@ impl<'a> Parser<'a> {
         let mut redirect_outs = Vec::new();
         let mut args = Vec::new();
         let mut inner_ast_ = None;
+        let mut env_vars = Vec::new();
         while let Some(cur_tkn) = self.advance() {
             match cur_tkn.kind {
-                /* args */
                 Tkn::Word => {
-                    if let Some(Tkn::Assign) = self.tkns.peek().map(|t| &t.kind) && args.is_empty() {
-                        //create a new AstNode::Assignment, lhs = this Word
-                        //rhs = an AstNode 
-                        return self.assign_to(get_token_at(cur_tkn, self.cmd_buf));
-                    } else {
-                        args.push(Cow::Borrowed(get_token_at(cur_tkn, self.cmd_buf)));
-                    }
+                    let word = get_token_at(cur_tkn, self.cmd_buf);
+                    //check if the next non-whitespace token is an '='
+                    if let Some(Tkn::Assign) = self.tkns.peek().map(|t| &t.kind) {
+                        env_vars.push(self.assign_to(word)?);
+                        continue
+                    } else if let Some(Tkn::Space) = self.tkns.peek().map(|t| &t.kind) {
+                        self.eat(Tkn::Space)?;
+                        if let Some(Tkn::Assign) = self.tkns.peek().map(|t| &t.kind) {
+                            env_vars.push(self.assign_to(word)?);
+                            continue
+                        }
+                    } 
+                    args.push(Cow::Borrowed(word));
                 }
                 Tkn::Assign => { 
                     anyhow::bail!("Syntax Err: invalid assignment");
@@ -121,6 +121,7 @@ impl<'a> Parser<'a> {
                 Tkn::Quote => { args.push(Cow::Borrowed(get_token_at(cur_tkn, self.cmd_buf))); },
                 /* redirects */ 
                 Tkn::RedirectIn => {
+                    if self.tkns.peek().map_or(false, |t| t.kind == Tkn::Space) { self.eat(Tkn::Space)?; }
                     //unwrap safe because lexer and shell prompt loop guarantees a valid delimiter found
                     let tkn = get_token_at(self.advance().unwrap(), self.cmd_buf);
                     let infile = if needs_escape(tkn) {
@@ -133,11 +134,13 @@ impl<'a> Parser<'a> {
                     redirect_ins.push(Redirect { dir: Redir::In, file: infile });
                 },
                 Tkn::RedirectOut => {
+                    if self.tkns.peek().map_or(false, |t| t.kind == Tkn::Space) { self.eat(Tkn::Space)?; }
                     let tkn = get_token_at(self.advance().unwrap(), self.cmd_buf);
                     let outfile = if needs_escape(tkn) { escape(tkn) } else { tkn.to_string() };
                     redirect_outs.push(Redirect { dir: Redir::Out, file: outfile });
                 },
                 Tkn::RedirectAppend => {
+                    if self.tkns.peek().map_or(false, |t| t.kind == Tkn::Space) { self.eat(Tkn::Space)?; }
                     let tkn = get_token_at(self.advance().unwrap(), self.cmd_buf);
                     let outfile = if needs_escape(tkn) { escape(tkn) } else { tkn.to_string() };
                     redirect_outs.push(Redirect { dir: Redir::Append, file: outfile });
@@ -146,6 +149,7 @@ impl<'a> Parser<'a> {
                     //must create owned copy of heredoc, because it later must cross thread boundary
                     let heredoc_content = self.heredocs.pop_front().unwrap_or("").to_string();
                     redirect_ins.push(Redirect { dir: Redir::Heredoc, file: heredoc_content });
+                    if self.tkns.peek().map_or(false, |t| t.kind == Tkn::Space) { self.eat(Tkn::Space)?; }
                     //eat the heredoc delimiter
                     match self.tkns.peek().map(|t| &t.kind) {
                         Some(Tkn::Word) => { 
@@ -169,16 +173,22 @@ impl<'a> Parser<'a> {
                 }
                 /* program delimiters */
                 Tkn::Newline | Tkn::Semicolon | Tkn::CmdOr | Tkn::CmdAnd | Tkn::RParen | Tkn::Pipe => {
-                    if args.is_empty() && inner_ast_.is_none() { 
+                    if args.is_empty() && inner_ast_.is_none() && env_vars.is_empty() { 
                         return Err(anyhow!("Syntax Err: empty args"));
                     }
                     //if inner_ast is some, then we built a subshell program
                     if let Some(inner_ast) = inner_ast_ {
+                        if !env_vars.is_empty() {
+                            anyhow::bail!("Syntax Err: invalid assignment");
+                        }
                         return Ok(Box::new(AstNode::Subshell(Subsh {
                             inner_ast,
                             redirect_ins,
                             redirect_outs,
                         })));
+                    }
+                    if !env_vars.is_empty() && args.is_empty() {
+                        return Ok(Box::new(AstNode::Assignments(env_vars)));
                     }
                     //if args[0] is a builtin command, then return astnode::builtin
                     if get_builtins().get(args[0].as_ref()).is_some() {
@@ -192,6 +202,7 @@ impl<'a> Parser<'a> {
                         args: args,
                         redirect_ins,
                         redirect_outs,
+                        env_vars,
                     })));
                 },
                 Tkn::Space => (),
@@ -276,7 +287,7 @@ impl<'a> Parser<'a> {
 
     fn ignore_next_program_delims(&mut self) {
         while let Some(tkn) = self.tkns.peek() {
-            if [Tkn::Newline, Tkn::Semicolon,].contains(&tkn.kind) {
+            if [Tkn::Newline, Tkn::Semicolon, Tkn::Space].contains(&tkn.kind) {
                 self.advance();
             } else { break; }
         }

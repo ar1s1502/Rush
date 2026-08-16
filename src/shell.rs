@@ -25,7 +25,6 @@ struct ShellState {
     pub tty: bool,   //connected to terminal?
     pub user: String,
     pub devicename: String,
-    pub vars: HashMap<String, String>,
 }
 
 thread_local! { //create these in thread local memory so that it can be accessed like mutable globals across modules
@@ -36,16 +35,26 @@ thread_local! { //create these in thread local memory so that it can be accessed
         tty: io::stdout().is_terminal() && io::stdin().is_terminal(),
         user: whoami::account().unwrap_or("<unknown>".to_string()),
         devicename: whoami::devicename().unwrap_or("<unknown>".to_string()).replace(" ","-"),
-        vars: HashMap::new(),
     });
+
+    pub static ENV_VARS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
 }
 
 pub fn is_debug() -> bool {
-    SHELL_STATE.with_borrow(|s| {s.debug})
+    SHELL_STATE.with_borrow(|s| s.debug)
 }
 fn is_tty() -> bool {
-    SHELL_STATE.with_borrow(|s| {s.tty})
+    SHELL_STATE.with_borrow(|s| s.tty)
 }
+pub fn get_env_var(key: &str) -> Option<String> {
+    ENV_VARS.with_borrow(|ev| 
+        ev.get(key).map(|val| val.clone())
+    )
+}
+pub fn put_env_var(key: String, val: String) -> Option<String> {
+    ENV_VARS.with_borrow_mut(|ev| ev.insert(key, val))
+}
+
 /* 
 OSC Escape sequence's data so that frontend typescript can differentiate between shell outputs
 OSC 133 syntax: \x1b]133;${data}\x07
@@ -101,7 +110,7 @@ fn main() -> rustyline::Result<()> {
     loop {
         //sleep fixes a weird race condition where sometimes the promptline prints before the output
         //on the cat << A | cat << B | cat << C test case
-        thread::sleep(Duration::from_millis(2)); 
+        thread::sleep(Duration::from_millis(1_5)); 
         let readline_res = RL_EDITOR.with_borrow_mut(|rl| {
             rl.readline(&prompt)
         });

@@ -1,6 +1,6 @@
 use crate::parser::{AstNode, Parser};
 use crate::lexer::{TknSpan, Tkn};
-use crate::{AS_SUBSHELL, RL_EDITOR, is_debug, exit_shell};
+use crate::{AS_SUBSHELL, RL_EDITOR, is_debug, exit_shell, put_env_var, get_env_var};
 use serde::{Deserialize, Serialize};
 use std::collections::{VecDeque, HashMap};
 use std::process::{self, Command, ExitStatus, Stdio, };
@@ -41,6 +41,29 @@ pub enum Redir {
 pub struct Redirect {
     pub dir: Redir,
     pub file: String,
+}
+
+#[derive(Serialize, Deserialize, )]
+pub struct Assignment<'a> {
+    pub lhs: &'a str, 
+    pub rhs: Vec<&'a str>,
+    pub delim_kind: Tkn, //which tkn kind finished the rhs
+}
+
+impl<'a> Assignment<'a> {
+    pub fn evaluate_rhs(&self) -> String {
+        let mut res = String::new();
+        for &expr in self.rhs.iter() {
+            if needs_escape(expr) {
+                res.push_str(&escape(expr));
+            } else {
+                res.push_str(expr);
+            }
+        }
+        println!("res: {}", res);
+        println!("delim_kind: {}", self.delim_kind);
+        res
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -85,6 +108,8 @@ pub struct ChildPr<'a> { //a child process spawned by shell
     // I/O streams for redirection
     pub redirect_ins: Vec<Redirect>,
     pub redirect_outs: Vec<Redirect>,
+    //assignments
+    pub env_vars: Vec<Assignment<'a>>,
 }
 
 impl<'a> ChildPr<'a> {
@@ -101,9 +126,16 @@ impl<'a> ChildPr<'a> {
         }
         handle.stdin(stdin);
         handle.stdout(stdout);
+        self.apply_env_vars(&mut handle);
         let mut c = handle.spawn()?;
         self.apply_redirect(&mut c)?;
         Ok(c)
+    }
+
+    fn apply_env_vars(&self, handle: &mut Command) {
+        for assignment in self.env_vars.iter() {
+            handle.env(assignment.lhs, assignment.evaluate_rhs());
+        }
     }
 
     //same as spawn, but will wait for process to finish and collect status
@@ -196,7 +228,7 @@ impl<'a> Subsh<'a> {
             AstNode::Builtin(builtin) => builtin.redirect_ins.extend(redirects),
             AstNode::Logical{ lhs,..} => self.apply_redirect_in(redirects, lhs)?,
             AstNode::Pipeline(pipeline) => self.apply_redirect_in(redirects, &mut pipeline[0])?,
-            AstNode::Assignment{ .. } => todo!(),
+            AstNode::Assignments{ .. } => (), //assignment expressions don't do i/o
         }
         Ok(())
     }
@@ -274,17 +306,16 @@ fn spawn_pipeline(progs: &mut Vec<Box<AstNode>>) -> anyhow::Result<Vec<process::
             },
             AstNode::Prog(child_pr) => {
                 let (c_stdout, c_stdin) = convert_pipe_fds(cur_pipe_write, cur_pipe_read);
-
                 children.push(child_pr.spawn(c_stdin, c_stdout)?);
             },
             AstNode::Subshell(subsh) => {
                 let (c_stdout, c_stdin) = convert_pipe_fds(cur_pipe_write, cur_pipe_read);
-
                 children.push(subsh.spawn(c_stdin, c_stdout)?);
             },
-            AstNode::Assignment{ lhs, rhs } => {
-                todo!();
-            }
+            //generally, a lone assignment within a pipeline doesn't affect shell state, 
+            //e.g. foo=BAR | cat $foo => foo is still undefined
+            //but can change this maybe?
+            AstNode::Assignments(..) => (), 
             _ => anyhow::bail!("unreachable, pipe can only have Prog or Subshell"),
         }
         cur_pipe_read = next_pipe_read;
@@ -348,8 +379,11 @@ fn dfs(node: &mut Box<AstNode>) -> anyhow::Result<i32> {
                 .code()
                 .unwrap_or(1));
         },
-        AstNode::Assignment{ lhs, rhs } => {
-            todo!();
+        AstNode::Assignments(env_vars) => {
+            for assignment in env_vars {
+                put_env_var(assignment.lhs.to_string(), assignment.evaluate_rhs());
+            }
+            Ok(0)
         }
     }
 }
