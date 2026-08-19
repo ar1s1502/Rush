@@ -1,14 +1,15 @@
-use crate::lexer::{LexerState, Tkn, lex_cmd_buf,  };
+use crate::lexer::{LexerState, Tkn, lex_cmd_buf, get_token_at };
 use logos::Logos;
 use anyhow::anyhow;
 
 #[allow(dead_code)]
 fn run_cmd(cmd_buf: &str, args: &[&str]) -> anyhow::Result<()> {
-    let lex_state = LexerState::new();
+    let lex_state = LexerState::new(cmd_buf);
     let mut lex = Tkn::lexer_with_extras(&cmd_buf, lex_state).spanned();
     match lex_cmd_buf(&mut lex, &cmd_buf) {
         Some((tkns, _)) => {
             for (i, tkn) in tkns.iter().enumerate() {
+                println!("{}", get_token_at(tkn, cmd_buf));
                 assert_eq!(&cmd_buf[tkn.span.start..tkn.span.end], args[i]); 
             }
             Ok(())
@@ -76,7 +77,7 @@ fn test_lexer() -> anyhow::Result<()> {
 
 #[allow(dead_code)]
 fn run_cmd_should_fail(cmd_buf: &str) -> bool {
-    let lex_state = LexerState::new();
+    let lex_state = LexerState::new(cmd_buf);
     let mut lex = Tkn::lexer_with_extras(&cmd_buf, lex_state).spanned();
     
     // Returns true if the lexer successfully caught the error and returned None

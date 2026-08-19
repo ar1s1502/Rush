@@ -1,5 +1,5 @@
 use crate::parser::{AstNode, Parser};
-use crate::lexer::{TknSpan, Tkn};
+use crate::lexer::{TknSpan, Tkn, get_token_at};
 use crate::{AS_SUBSHELL, RL_EDITOR, is_debug, exit_shell, put_env_var, get_env_var};
 use serde::{Deserialize, Serialize};
 use std::collections::{VecDeque, HashMap};
@@ -14,6 +14,8 @@ use std::thread;
 use std::mem;
 use rustyline::history::{History, SearchDirection};
 
+pub type Word = Vec<TknSpan>; // A word is any combination of Tkn::Literal, Tkn::SingleQuote,
+                              // Tkn::DoubleQuote, or Tkn::Expansion ($.., ${..}, $(..), or `...`)
 type BuiltinFn = fn(&[&str], Option<PipeReader>) -> anyhow::Result<String>;
 
 //Global immutable hashmap of <builtin command name>:<function to execute builtin>
@@ -29,7 +31,7 @@ pub fn get_builtins() -> &'static HashMap<&'static str, BuiltinFn> {
     })
 }
 
-#[derive(Serialize, Deserialize, )]
+#[derive(Serialize, Deserialize, PartialEq)]
 pub enum Redir {
     In, //<
     Out,//>
@@ -37,39 +39,23 @@ pub enum Redir {
     Heredoc,//<<
 }
 
-#[derive(Serialize, Deserialize, )]
+#[derive(Serialize, Deserialize)]
 pub struct Redirect {
     pub dir: Redir,
-    pub file: String,
+    pub file: Word,
+    pub heredoc_file: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, )]
-pub struct Assignment<'a> {
-    pub lhs: &'a str, 
-    pub rhs: Vec<&'a str>,
-    pub delim_kind: Tkn, //which tkn kind finished the rhs
-}
-
-impl<'a> Assignment<'a> {
-    pub fn evaluate_rhs(&self) -> String {
-        let mut res = String::new();
-        for &expr in self.rhs.iter() {
-            if needs_escape(expr) {
-                res.push_str(&escape(expr));
-            } else {
-                res.push_str(expr);
-            }
-        }
-        println!("res: {}", res);
-        println!("delim_kind: {}", self.delim_kind);
-        res
-    }
+pub struct Assignment {
+    pub lhs: Word,
+    pub rhs: Word,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct Builtin<'a> { //built in command 
-    #[serde(borrow)]
-    pub args: Vec<Cow<'a, str>>,
+    pub args: Vec<Word>,
+    pub cmd_buf: Cow<'a, str>,
     // I/O streams for redirection
     pub redirect_ins: Vec<Redirect>,
     pub redirect_outs: Vec<Redirect>,
@@ -78,15 +64,15 @@ pub struct Builtin<'a> { //built in command
 impl<'a> Builtin<'a> {
     pub fn exec_builtin(&mut self, pipe_write: Option<PipeWriter>, pipe_read: Option<PipeReader>)
     -> anyhow::Result<()> {
-        expand_quotes(&mut self.args);
-        let cleaned_asref: Vec<&str> = self.args.iter().map(|arg| arg.as_ref()).collect();
+        let cleaned_args = clean_args(&self.args, &self.cmd_buf);
+        let cleaned_asref: Vec<&str> = cleaned_args.iter().map(|arg| arg.as_ref()).collect();
         let builtin_fn = get_builtins().get(cleaned_asref[0]).unwrap(); //unwrap safe because parser checks if in builtins
         match builtin_fn(&cleaned_asref, pipe_read) {
             Ok(output_str) => {
                 if !self.redirect_outs.is_empty() {
                     let redirects = mem::take(&mut self.redirect_outs);
                     use std::io::Cursor;
-                    write_to_redirect_outs(redirects, Cursor::new(output_str))?;
+                    write_to_redirect_outs(redirects, Cursor::new(output_str), &self.cmd_buf)?;
                 } else if let Some(mut pipe_writer) = pipe_write {
                     thread::spawn(move || {
                         let _ = pipe_writer.write_all(output_str.as_bytes());
@@ -103,13 +89,13 @@ impl<'a> Builtin<'a> {
 
 #[derive(Serialize, Deserialize)]
 pub struct ChildPr<'a> { //a child process spawned by shell
-    #[serde(borrow)]
-    pub args: Vec<Cow<'a, str>>,
+    pub args: Vec<Word>,
+    pub cmd_buf: Cow<'a, str>,
     // I/O streams for redirection
     pub redirect_ins: Vec<Redirect>,
     pub redirect_outs: Vec<Redirect>,
     //assignments
-    pub env_vars: Vec<Assignment<'a>>,
+    pub env_vars: Vec<Assignment>,
 }
 
 impl<'a> ChildPr<'a> {
@@ -118,8 +104,8 @@ impl<'a> ChildPr<'a> {
         if !self.redirect_ins.is_empty() { stdin = Stdio::piped(); }
         if !self.redirect_outs.is_empty() { stdout = Stdio::piped(); }
         
-        expand_quotes(&mut self.args);
-        let cleaned_asref: Vec<&str> = self.args.iter().map(|arg| arg.as_ref()).collect();
+        let cleaned = clean_args(&self.args, &self.cmd_buf);
+        let cleaned_asref: Vec<&str> = cleaned.iter().map(|arg| arg.as_ref()).collect();
         let mut handle = Command::new(cleaned_asref[0]);
         if cleaned_asref.len() > 1 {
             handle.args(&cleaned_asref[1..]); 
@@ -134,7 +120,9 @@ impl<'a> ChildPr<'a> {
 
     fn apply_env_vars(&self, handle: &mut Command) {
         for assignment in self.env_vars.iter() {
-            handle.env(assignment.lhs, assignment.evaluate_rhs());
+            let key = eval_word(&assignment.lhs, &self.cmd_buf);
+            let val = eval_word(&assignment.rhs, &self.cmd_buf);
+            handle.env(&key, &val);
         }
     }
 
@@ -145,20 +133,34 @@ impl<'a> ChildPr<'a> {
     }
 
     //apply any redirect operators (<, <<, >, >>)
+    //if any steps in here fail, make sure to kill the child process early to avoid zombies
     fn apply_redirect(&mut self, c: &mut process::Child) -> anyhow::Result<()> {
         if !self.redirect_ins.is_empty() {
             let mut stdin_handle = c.stdin.take().expect("Failed to take child stdin handle");
             let redirects = mem::take(&mut self.redirect_ins);
+            let mut infiles = VecDeque::with_capacity(redirects.len());
+            for r in redirects.iter() {
+                if r.dir == Redir::In { 
+                    let infile = eval_word(&r.file, &self.cmd_buf);
+                    if !Path::new(&infile).is_file() { 
+                        c.kill()?;
+                        anyhow::bail!("ERR: {}... is not a valid file", get_token_at(&r.file[0], &self.cmd_buf)); 
+                    }
+                    infiles.push_back(infile);
+                }
+            }
             thread::spawn(move || {
                 for r in redirects.into_iter() {
                     match r.dir {
                         Redir::Heredoc => { 
                             //Redirect.file is heredoc content in this case, not file path
-                            let _ = stdin_handle.write_all((&r.file).as_bytes());
+                            if let Some(heredoc_content) = r.heredoc_file {
+                                let _ = stdin_handle.write_all(heredoc_content.as_bytes());
+                            }
                         },
                         Redir::In => {
-                            if !Path::new(&r.file).is_file() { anyhow::bail!("ERR: {} is not a valid file", r.file); }
-                            if let Ok(mut f) = File::open(&r.file) {
+                            let infile = infiles.pop_front().unwrap();
+                            if let Ok(mut f) = File::open(&infile) {
                                 //write to child stdin in chunks until f's eof
                                 let _ = std::io::copy(&mut f, &mut stdin_handle);
                             }
@@ -166,13 +168,19 @@ impl<'a> ChildPr<'a> {
                         _ => (),
                     }
                 }
-                Ok(())
             });
         }
         if !self.redirect_outs.is_empty() {
-            let stdout_handle = c.stdout.take().expect("Failed to take child stdout handle");
-            let redirects = mem::take(&mut self.redirect_outs);
-            write_to_redirect_outs(redirects, stdout_handle)?;
+            if let Some(stdout_handle) = c.stdout.take() {
+                let redirects = mem::take(&mut self.redirect_outs);
+                if let Err(e) = write_to_redirect_outs(redirects, stdout_handle, &self.cmd_buf) {
+                    c.kill()?;
+                    return Err(e);
+                }
+            } else {
+                c.kill()?;
+                anyhow::bail!("Failed to take child stdout handle of program {}", eval_word(&self.args[0], &self.cmd_buf));
+            }
         }
 
         Ok(()) 
@@ -182,6 +190,8 @@ impl<'a> ChildPr<'a> {
 
 #[derive(Serialize, Deserialize)]
 pub struct Subsh<'a> {
+    pub cmd_buf: Cow<'a, str>,
+
     #[serde(borrow)]
     pub inner_ast: Vec<Box<AstNode<'a>>>,
 
@@ -209,9 +219,16 @@ impl<'a> Subsh<'a> {
             .stdout(stdout)
             .spawn()?;
         if !self.redirect_outs.is_empty() {
-            let stdout_handle = subsh.stdout.take().expect("failed to take child process stdout");
-            let redirects = mem::take(&mut self.redirect_outs);
-            write_to_redirect_outs(redirects, stdout_handle)?;
+            if let Some(stdout_handle) = subsh.stdout.take() {
+                let redirects = mem::take(&mut self.redirect_outs);
+                if let Err(e) = write_to_redirect_outs(redirects, stdout_handle, &self.cmd_buf) {
+                    subsh.kill()?;
+                    return Err(e);
+                }
+            } else {
+                subsh.kill()?;
+                anyhow::bail!("Failed to take subshell process's stdout handle");
+            }
         }
         Ok(subsh)
     }
@@ -235,23 +252,24 @@ impl<'a> Subsh<'a> {
 
 }
 
-fn write_to_redirect_outs<T>(redirects: Vec<Redirect>, mut stdout_handle: T) -> anyhow::Result<()> 
+fn write_to_redirect_outs<T>(redirects: Vec<Redirect>, mut stdout_handle: T, cmd_buf: &str) -> anyhow::Result<()> 
 where 
     T: Read + std::marker::Send + 'static, //Send and static required because moving across thread bound
 {
     let mut outfiles = Vec::new();
     //create/open all outfiles. (per Bourne shell, this happens even if command stdout is never written to)
     for r in redirects.iter() {
+        let filename = eval_word(&r.file, cmd_buf);
         match r.dir {
             Redir::Out => outfiles.push(OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
-                .open(&r.file)?), //This should be equivalent to File::create
+                .open(&filename)?), //This should be equivalent to File::create
             Redir::Append => outfiles.push(OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&r.file)?),
+                .open(&filename)?),
             _ => anyhow::bail!("unreachable: got redirect in while executing redirect out"),
         }
     }
@@ -312,10 +330,10 @@ fn spawn_pipeline(progs: &mut Vec<Box<AstNode>>) -> anyhow::Result<Vec<process::
                 let (c_stdout, c_stdin) = convert_pipe_fds(cur_pipe_write, cur_pipe_read);
                 children.push(subsh.spawn(c_stdin, c_stdout)?);
             },
-            //generally, a lone assignment within a pipeline doesn't affect shell state, 
+            //generally, an assignment within a pipeline doesn't affect shell state, 
             //e.g. foo=BAR | cat $foo => foo is still undefined
             //but can change this maybe?
-            AstNode::Assignments(..) => (), 
+            AstNode::Assignments{ .. } => (), 
             _ => anyhow::bail!("unreachable, pipe can only have Prog or Subshell"),
         }
         cur_pipe_read = next_pipe_read;
@@ -379,19 +397,21 @@ fn dfs(node: &mut Box<AstNode>) -> anyhow::Result<i32> {
                 .code()
                 .unwrap_or(1));
         },
-        AstNode::Assignments(env_vars) => {
-            for assignment in env_vars {
-                put_env_var(assignment.lhs.to_string(), assignment.evaluate_rhs());
+        AstNode::Assignments{ assignments, cmd_buf } => {
+            for assignment in assignments {
+                let key = eval_word(&assignment.lhs, &cmd_buf);
+                let val = eval_word(&assignment.rhs, &cmd_buf);
+                put_env_var(key, val);
             }
             Ok(0)
         }
     }
 }
 
-pub fn execute_cmd_buf<'w> (cmd_buf: &'w str, tkns: &'w [TknSpan], heredocs: VecDeque<&'w str>) -> anyhow::Result<i32> {
+pub fn execute_cmd_buf<'w> (cmd_buf: &'w str, tkns: &'w mut [TknSpan], heredocs: VecDeque<&'w str>) -> anyhow::Result<i32> {
     let executables = Parser::new(tkns, heredocs, cmd_buf).parse()?;
     if is_debug() { println!("\nOUTPUT!!"); }
-    execute_ast(executables)
+    Ok(execute_ast(executables)?)
 }
 
 pub fn execute_ast(mut executables: Vec<Box<AstNode>>) -> anyhow::Result<i32> {
@@ -402,39 +422,77 @@ pub fn execute_ast(mut executables: Vec<Box<AstNode>>) -> anyhow::Result<i32> {
     Ok(res)
 }
 
-//evaluate quoted strings in args
-fn expand_quotes<'a>(args: &mut Vec<Cow<'a, str>>) {
-    for i in 0..args.len() {
-        let arg = args[i].as_ref();
-        if needs_escape(arg) {
-            args[i] = Cow::Owned(escape(arg));
-        } 
+fn clean_args<'a>(args: &'a Vec<Word>, cmd_buf: &'a Cow<'a, str>) -> Vec<Cow<'a, str>> {
+    let mut cleaned = Vec::with_capacity(args.len());
+    for arg in args.iter() {
+        if arg.len() == 1 && arg[0].kind == Tkn::Literal { 
+            //minimize heap allocation for an arg thats just a Tkn Literal
+            cleaned.push(Cow::Borrowed(get_token_at(&arg[0], cmd_buf)));
+        } else {
+            cleaned.push(Cow::Owned(eval_word(arg, cmd_buf)));
+        }
     }
+    cleaned
 }
 
-pub fn needs_escape(arg: &str) -> bool { 
-    arg.starts_with("\"") || arg.starts_with("'") 
+pub fn eval_word(w: &Word, cmd_buf: impl AsRef<str>) -> String {
+    let mut res = String::new();
+    for part in w.iter() {
+        let tkn_literal = get_token_at(part, &cmd_buf);
+        match &part.kind {
+            Tkn::DoubleQuote(tknspans) => res.push_str(&eval_dquote(tknspans, &cmd_buf)),
+            Tkn::SingleQuote => res.push_str(&tkn_literal[1..tkn_literal.len()-1]),
+            Tkn::Literal => res.push_str(tkn_literal),
+            Tkn::Expansion => res.push_str(&eval_envvar(tkn_literal)),
+            _ => (), //unreachable, lexer guarantees a Tkn::Word has only above 4 types of Tkns
+        }
+    }
+    res
 }
 
-//evaluates a quoted string
-pub fn escape(arg: &str) -> String {
-    if arg.len() < 2 {
-        return arg.to_string();
+fn eval_envvar<'a>(expr: &'a str) -> String {
+    //`VAR`
+    if expr.starts_with("`") && expr.ends_with("`") {
+        let key = &expr[1..expr.len()-1];
+        return get_env_var(key);
+    }
+    //$VAR
+    if expr.len() > 1 && expr.starts_with("$") { //$abc
+        let key = &expr[1..];
+        return get_env_var(key);
+    }
+    "$".to_string()
+} 
+
+pub fn eval_dquote<'a>(tknspans: &'a [TknSpan], cmd_buf: &'a impl AsRef<str>) -> Cow<'a, str> {
+    //fast path: dquoted string has no expansions and doesn't have any '\' characters (nothing needs
+    //to be escaped), so minimize heap allocation via Cow::Borrowed
+    if tknspans.len() == 1 && tknspans[0].kind == Tkn::Literal && !get_token_at(&tknspans[0], cmd_buf).contains('\\') {
+        return Cow::Borrowed(get_token_at(&tknspans[0], cmd_buf));
+    }
+    let cmd_str = cmd_buf.as_ref();
+    let mut res = String::new();
+    for tknspan in tknspans {
+        let tkn_literal = get_token_at(tknspan, cmd_str);
+        match &tknspan.kind {
+            Tkn::Literal => res.push_str(&escape(tkn_literal)),
+            Tkn::Expansion => res.push_str(&eval_envvar(tkn_literal)),
+            _ => (),
+        }
+    }
+    Cow::Owned(res)
+}
+
+pub fn escape<'a>(arg: &'a str) -> Cow<'a, str> {
+    // Fast path: if there are no backslashes, return a zero-allocation borrowed reference
+    if !arg.contains('\\') {
+        return Cow::Borrowed(arg);
     }
 
-    //get opening quote (' or " or `)
-    let quote = arg.chars().nth(0).unwrap();
-    //lexer guarantees that all quoted strings are properly formatted, so this should be safe
-    let inner_str = &arg[1..arg.len()-1];
-    // Single quotes are literal; no escaping happens inside them.
-    if quote == '\'' {
-        return inner_str.to_string();
-    }
-
-    // Double quotes require escape processing.
-    let mut owned = String::with_capacity(inner_str.len());
+    let mut owned = String::with_capacity(arg.len());
     let mut in_escape = false;
-    for c in inner_str.chars() {
+
+    for c in arg.chars() {
         if in_escape {
             match c {
                 'n' => owned.push('\n'),
@@ -444,8 +502,7 @@ pub fn escape(arg: &str) -> String {
                 '"' => owned.push('"'),
                 '`' => owned.push('`'),
                 '$' => owned.push('$'),
-                // POSIX Shell Rule: If a backslash precedes a character that 
-                // doesn't have a special meaning, both the backslash and the character are preserved.
+                // POSIX Rule: Preserve backslash if preceding a non-special character
                 _ => {
                     owned.push('\\');
                     owned.push(c);
@@ -459,11 +516,12 @@ pub fn escape(arg: &str) -> String {
         }
     }
 
-    // If the string ended with an unclosed backslash, preserve it
+    // Preserve dangling trailing backslash
     if in_escape {
         owned.push('\\');
     }
-    owned
+
+    Cow::Owned(owned)
 }
 
 /* BUILTINS */

@@ -46,9 +46,9 @@ pub fn is_debug() -> bool {
 fn is_tty() -> bool {
     SHELL_STATE.with_borrow(|s| s.tty)
 }
-pub fn get_env_var(key: &str) -> Option<String> {
+pub fn get_env_var(key: &str) -> String {
     ENV_VARS.with_borrow(|ev| 
-        ev.get(key).map(|val| val.clone())
+        ev.get(key).map_or("".to_string(), |val| val.clone())
     )
 }
 pub fn put_env_var(key: String, val: String) -> Option<String> {
@@ -119,15 +119,14 @@ fn main() -> rustyline::Result<()> {
                 if input.trim().is_empty() { continue; }
                 cmd_buf.push_str(&input);
                 cmd_buf.push('\n'); //add back newline that readline stripped after user hit Enter
-                let lex_state = LexerState::new();
-                let mut lex = Tkn::lexer_with_extras(&cmd_buf, lex_state).spanned();
+                let mut lex = Tkn::lexer_with_extras(&cmd_buf, LexerState::new(&cmd_buf)).spanned();
                 match lex_cmd_buf(&mut lex, &cmd_buf) {
-                    Some((tkns, heredocs)) => {
+                    Some((mut tkns, heredocs)) => {
                         send_osc133(PROMPT_END);
                         send_osc133(CMD_OUTPUT_START);
                         if is_debug() { print_cmd(&tkns, &heredocs); }
-                        if let Err(e) = execute_cmd_buf(&cmd_buf, &tkns, heredocs) {
-                            eprintln!("ERR: {}", e);
+                        if let Err(e) = execute_cmd_buf(&cmd_buf, &mut tkns, heredocs) {
+                            eprintln!("{}", e);
                         }
                         send_osc133(CMD_END);
                         set_normal_prompt(&mut prompt,);
@@ -153,8 +152,6 @@ fn main() -> rustyline::Result<()> {
                             set_expected_closer_prompt(&mut prompt, closer);
                         } else if let Some(ref op) = lex.extras.continuation_for {
                             set_needs_continuation_prompt(&mut prompt, op);
-                        } else if let Some(ref bracket) = lex.extras.bracket_closers.front() {
-                            set_expected_closer_prompt(&mut prompt, &bracket.to_string());
                         }
                     }
                 }
@@ -210,6 +207,7 @@ fn set_expected_closer_prompt(prompt: &mut String, closer: &str) {
         "`" => *prompt = String::from("bquote> "),
         "\"" => *prompt = String::from("dquote> "),
         ")" => *prompt = String::from("subsh> "),
+        "$)" => *prompt = String::from("CmdSubs> "),
         _ => *prompt = format!("missing {} for heredoc> ", closer),
     }
     send_osc133(&format!("{};{}", PROMPT_START, prompt))

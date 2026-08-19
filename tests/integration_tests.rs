@@ -10,17 +10,49 @@ const GREEN: &'static str = "\x1b[32m";
 const CYAN: &'static str = "\x1b[36m";
 const NC: &'static str = "\x1b[0m";
 
-fn trim_debug_output(output: &str) -> (&str, &str) {
-    if let Some(pos) = output.find("OUTPUT!!") {
-        return (&output[..pos-2], &output[pos+9..]);
+fn trim_debug_output(output: &str) -> (String, String) {
+    let mut debug_accum = String::new();
+    let mut output_accum = String::new();
+
+    let debug_marker = "DEBUG OUTPUT!";
+    let output_marker = "OUTPUT!!";
+
+    let mut curr = output;
+
+    while let Some(debug_idx) = curr.find(debug_marker) {
+        // Advance past "DEBUG OUTPUT!"
+        let after_debug = &curr[debug_idx + debug_marker.len()..];
+
+        if let Some(out_idx) = after_debug.find(output_marker) {
+            // Collect debug slice: from "DEBUG OUTPUT!" up to 'O' in "OUTPUT!!"
+            debug_accum.push_str(&after_debug[..out_idx]);
+
+            // Advance past "OUTPUT!!"
+            let after_output = &after_debug[out_idx + output_marker.len()..];
+
+            // The output section runs until the next "DEBUG OUTPUT!" or EOF
+            if let Some(next_debug_idx) = after_output.find(debug_marker) {
+                output_accum.push_str(&after_output[..next_debug_idx]);
+                curr = &after_output[next_debug_idx..];
+            } else {
+                output_accum.push_str(after_output);
+                break;
+            }
+        } else {
+            // "DEBUG OUTPUT!" was found without a matching "OUTPUT!!", collect remainder
+            debug_accum.push_str(after_debug);
+            break;
+        }
     }
-    (output, output)
+
+    (debug_accum, output_accum)
 }
 
 fn no_output() -> String {
     "".to_string()
 }
 
+//get output of <cmd> for bash/zsh, for comparison with rush
 fn get_output(cmd: &str) -> String {
     let output = Command::new("sh")
         .arg("-c")
@@ -36,6 +68,7 @@ fn run_test(cmd: &str, expected: String) -> anyhow::Result<()> {
         .arg("--debug")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()?;
 
     let mut shell_stdin = shell.stdin.take().expect("Failed to take shell program stdin");
@@ -44,10 +77,11 @@ fn run_test(cmd: &str, expected: String) -> anyhow::Result<()> {
 
     let res = shell.wait_with_output()?;
     assert!(res.status.success());
-    let (debug_info, output) = trim_debug_output(str::from_utf8(&res.stdout).unwrap_or(""));
-    println!("DEBUG_INFO:\n{}", debug_info);
-    println!("OUTPUT:\n{}", output);
-    assert_eq!(output.trim(), expected.trim());
+    let (debug_output, output) = trim_debug_output(str::from_utf8(&res.stdout).unwrap_or(""));
+    if output.trim() != expected.trim() {
+        let stderr = str::from_utf8(&res.stderr).unwrap_or("");
+        anyhow::bail!("{}\n{}\n{}", stderr, debug_output, output);
+    }
     println!("{}PASS{}\n", GREEN, NC);
     Ok(())
 }
@@ -218,16 +252,16 @@ fn redirects() -> anyhow::Result<()> {
     for test in tests.into_iter() {
         if let Err(e) = run_test(test.0, test.1) {
             // cleanup
-            remove_file("temp.txt")?;
-            remove_file("temp2.txt")?;
-            remove_file("temp3.txt")?;
+            let _ = remove_file("temp.txt");
+            let _ = remove_file("temp2.txt");
+            let _ = remove_file("temp3.txt");
             anyhow::bail!(e);
         }
     }
     // cleanup
-    remove_file("temp.txt")?;
-    remove_file("temp2.txt")?;
-    remove_file("temp3.txt")?;
+    let _ = remove_file("temp.txt");
+    let _ = remove_file("temp2.txt");
+    let _ = remove_file("temp3.txt");
     Ok(())
 }
 
@@ -356,18 +390,96 @@ fn escapes() -> anyhow::Result<()> {
 }
 
 #[test]
+fn assignments() -> anyhow::Result<()> {
+    let tests = vec![
+        // Silent Assignment: Confirms standalone variable assignments produce no output.
+        (
+            "foo=bar\n",
+            no_output()
+        ),
+        // Simple Global Assignment: Verifies assigning a variable and referencing it across commands.
+        (
+            "foo=bar\necho $foo\n",
+            "bar\n".to_string()
+        ),
+        // Semicolon Sequential Assignments: Confirms multiple assignments separated by semicolons persist in shell state.
+        (
+            "foo=bar; baz=1; echo $foo$baz\n",
+            "bar1\n".to_string()
+        ),
+        // Flexible Whitespace Around '=': Validates that spaces surrounding the assignment operator are properly handled.
+        (
+            "a = 1\nb=  2\nc   =3\necho $a $b $c\n",
+            "1 2 3\n".to_string()
+        ),
+        // Double-Quote Interpolation: Ensures variable expansion occurs inside double quotes.
+        (
+            "foo=hello\necho \"$foo world\"\n",
+            "hello world\n".to_string()
+        ),
+        // Single-Quote Literal Treatment: Ensures variables inside single quotes remain unexpanded raw literals.
+        (
+            "foo=hello\necho '$foo'\n",
+            "$foo\n".to_string()
+        ),
+        // Complex Compound Word Part Assignment: Verifies concatenating literals, single/double quotes, and variable expansions within an assignment.
+        (
+            "foo=hello\nfoo=hello$foo\"world\"\"$foo\"'asdf'\necho $foo\n",
+            "hellohelloworldhelloasdf\n".to_string()
+        ),
+        // Inline Assignment Scope: Confirms inline assignments pass into child processes without polluting parent shell state.
+        (
+            "FOO=bar sh -c 'echo $FOO'\necho $FOO\n",
+            "bar\n\n".to_string()
+        ),
+    ];
+
+    for test in tests.into_iter() {
+        run_test(test.0, test.1)?;
+    }
+    Ok(())
+}
+
+#[test]
 fn combined_operators() -> anyhow::Result<()> {
+    // List of exact files created by this test so we never touch other tests' files
+    let test_files = [
+        "errors.log",
+        "system.log",
+        "audit.log",
+        "result.txt",
+        "file1.txt",
+        "file2.txt",
+        "nested_test.txt",
+        "test_out.txt",
+        "test_in.txt",
+        "test_app.txt",
+        "my file.txt",
+    ];
+
+    // Helper closure to safely remove ONLY our test files
+    let cleanup = || {
+        for file in &test_files {
+            let _ = std::fs::remove_file(file);
+        }
+    };
+
+    // Clean up any stale state before running
+    cleanup();
+
     // SETUP
     let mut error_log = File::create("errors.log")?;
-    error_log.write_all(b"2026-07-19 SUCCESS: Database connected successfully.\n\
+    error_log.write_all(
+        b"2026-07-19 SUCCESS: Database connected successfully.\n\
          2026-07-19 ERROR: Failed to bind to interface on port 8080.\n\
-         2026-07-19 WARN: High disk latency detected.\n"
+         2026-07-19 WARN: High disk latency detected.\n",
     )?;
     let mut system_log = File::create("system.log")?;
-    system_log.write_all(b"2026-07-19 SUCCESS: Database connected successfully.\n\
+    system_log.write_all(
+        b"2026-07-19 SUCCESS: Database connected successfully.\n\
          2026-07-19 ERROR: Failed to bind to interface on port 8080.\n\
-         2026-07-19 WARN: High disk latency detected.\n\
-    ")?;
+         2026-07-19 WARN: High disk latency detected.\n",
+    )?;
     let mut audit_log = File::create("audit.log")?;
     audit_log.write_all(b"AUDIT\n")?;
     let cwd = std::env::current_dir().unwrap();
@@ -394,8 +506,6 @@ fn combined_operators() -> anyhow::Result<()> {
             "(cat | grep \"critical\") <errors.log>result.txt || echo pipeline fail\n",
             "pipeline fail".to_string()
         ),
-        // VERIFICATION: Because "critical" didn't match anything in error.log, 
-        // grep exits with 1, leaving result.txt created but completely empty (0 bytes).
         (
             "cat result.txt\n", 
             no_output()
@@ -419,8 +529,6 @@ fn combined_operators() -> anyhow::Result<()> {
             "(grep \"ERROR\" && echo \"found errors\"\n) < system.log >> audit.log || echo \"audit failed\"\n",
             no_output()
         ),
-        // VERIFICATION: audit.log originally held "AUDIT\n". The kitchen sink test 
-        // matches the ERROR line via grep, then appends the byte count of "found errors\n" (13).
         (
             "cat audit.log\n",
             "AUDIT\n2026-07-19 ERROR: Failed to bind to interface on port 8080.\nfound errors".to_string()
@@ -440,13 +548,10 @@ fn combined_operators() -> anyhow::Result<()> {
         ),
 
         // Deep AST Stress Test: Nested Subshell as First Program with Outer Redirections
-        // The outer subshell is redirected. Its very first AST node is an inner subshell `(grep)`.
-        // The inner subshell must transparently inherit the stdin (errors.log) and stdout (nested_test.txt) overrides from the outer shell.
         (
             "((grep \"ERROR\") && echo \"inner execution complete\") < errors.log > nested_test.txt\n",
             no_output(),
         ),
-        // VERIFICATION: Check that the outer stdout redirect caught both the output of the inner subshell AND the outer echo command.
         (
             "cat nested_test.txt\n",
             "2026-07-19 ERROR: Failed to bind to interface on port 8080.\ninner execution complete\n".to_string()
@@ -491,14 +596,17 @@ fn combined_operators() -> anyhow::Result<()> {
         ),
     ];
 
+    // Execute tests
+    let mut res = Ok(());
     for test in tests.into_iter() {
         if let Err(e) = run_test(test.0, test.1) {
-            // cleanup
-            let _ = Command::new("sh").arg("-c").arg("rm *.log *.txt").status();
-            anyhow::bail!(e);
+            res = Err(anyhow::anyhow!(e));
+            break;
         }
     }
-    // cleanup
-    let _ = Command::new("sh").arg("-c").arg("rm *.log *.txt").status();
-    Ok(())
+
+    // Always clean up our explicit list of files
+    cleanup();
+    res
 }
+
