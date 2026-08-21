@@ -1,9 +1,10 @@
 use crate::parser::{AstNode, Parser};
-use crate::lexer::{TknSpan, Tkn, get_token_at};
-use crate::{AS_SUBSHELL, RL_EDITOR, is_debug, exit_shell, put_env_var, get_env_var};
+use crate::lexer::{LexerState, Tkn, TknSpan, get_token_at, lex_cmd_buf};
+use crate::{AS_SUBSHELL, RL_EDITOR, is_debug, set_debug, exit_shell, put_env_var, get_env_var};
+use logos::Logos;
 use serde::{Deserialize, Serialize};
 use std::collections::{VecDeque, HashMap};
-use std::process::{self, Command, ExitStatus, Stdio, };
+use std::process::{self, Command, Stdio, };
 use std::borrow::Cow;
 use std::fs::{File, OpenOptions, };
 use std::io::{Write, self, PipeReader, PipeWriter, Read};
@@ -13,6 +14,8 @@ use std::sync::OnceLock;
 use std::thread;
 use std::mem;
 use rustyline::history::{History, SearchDirection};
+
+use std::ffi::OsStr;
 
 pub type Word = Vec<TknSpan>; // A word is any combination of Tkn::Literal, Tkn::SingleQuote,
                               // Tkn::DoubleQuote, or Tkn::Expansion ($.., ${..}, $(..), or `...`)
@@ -81,7 +84,7 @@ impl<'a> Builtin<'a> {
                     println!("{}", output_str);
                 }
             },
-            Err(e) => eprintln!("{}", e),
+            Err(e) => eprintln!("Rush: {}", e),
         }
         Ok(())
     }
@@ -126,10 +129,23 @@ impl<'a> ChildPr<'a> {
         }
     }
 
-    //same as spawn, but will wait for process to finish and collect status
-    pub fn status(&mut self) -> anyhow::Result<ExitStatus> {
-        let mut c = self.spawn(Stdio::inherit(), Stdio::inherit())?;
-        Ok(c.wait()?)
+    //same as spawn, but will wait for process to finish and collect exit code
+    pub fn status(&mut self) -> i32 {
+        match self.spawn(Stdio::inherit(), Stdio::inherit()) {
+            Ok(mut c) => {
+                match c.wait() {
+                    Err(e) => {
+                        eprintln!("Rush: {}", e);
+                        return 1;
+                    }
+                    Ok(exitstat) => return exitstat.code().unwrap_or(1),
+                }
+            }
+            Err(e) => {
+                eprintln!("Rush: {}", e); 
+                return 1; 
+            }
+        }
     }
 
     //apply any redirect operators (<, <<, >, >>)
@@ -217,6 +233,7 @@ impl<'a> Subsh<'a> {
             .env(AS_SUBSHELL, &serialized_ast)
             .stdin(stdin)
             .stdout(stdout)
+            .stderr(Stdio::piped())
             .spawn()?;
         if !self.redirect_outs.is_empty() {
             if let Some(stdout_handle) = subsh.stdout.take() {
@@ -233,9 +250,22 @@ impl<'a> Subsh<'a> {
         Ok(subsh)
     }
 
-    pub fn status(&mut self) -> anyhow::Result<ExitStatus> {
-        let mut c = self.spawn(Stdio::inherit(), Stdio::inherit())?;
-        Ok(c.wait()?)
+    pub fn status(&mut self) -> i32 {
+        match self.spawn(Stdio::inherit(), Stdio::inherit()) {
+            Ok(mut c) => {
+                match c.wait() {
+                    Err(e) => {
+                        eprintln!("Rush: {}", e);
+                        return 1;
+                    }
+                    Ok(exitstat) => return exitstat.code().unwrap_or(1),
+                }
+            }
+            Err(e) => {
+                eprintln!("Rush: {}", e); 
+                return 1; 
+            }
+        }
     }
 
     fn apply_redirect_in (&self, redirects: Vec<Redirect>, first_node: &mut Box<AstNode<'a>>) -> anyhow::Result<()> {
@@ -350,9 +380,7 @@ fn dfs(node: &mut Box<AstNode>) -> anyhow::Result<i32> {
         }
         AstNode::Prog(child_pr) => {
             if child_pr.args.is_empty() { return Ok(0); }
-            return Ok(child_pr.status()?
-                .code()
-                .unwrap_or(1));
+            return Ok(child_pr.status());
         },
         AstNode::Logical { 
             lhs, 
@@ -393,9 +421,7 @@ fn dfs(node: &mut Box<AstNode>) -> anyhow::Result<i32> {
             return Ok(0);
         },
         AstNode::Subshell(subshell) => {
-            return Ok(subshell.status()?
-                .code()
-                .unwrap_or(1));
+            return Ok(subshell.status());
         },
         AstNode::Assignments{ assignments, cmd_buf } => {
             for assignment in assignments {
@@ -443,18 +469,27 @@ pub fn eval_word(w: &Word, cmd_buf: impl AsRef<str>) -> String {
             Tkn::DoubleQuote(tknspans) => res.push_str(&eval_dquote(tknspans, &cmd_buf)),
             Tkn::SingleQuote => res.push_str(&tkn_literal[1..tkn_literal.len()-1]),
             Tkn::Literal => res.push_str(tkn_literal),
-            Tkn::Expansion => res.push_str(&eval_envvar(tkn_literal)),
+            Tkn::Expansion => res.push_str(&eval_expansion(tkn_literal)),
             _ => (), //unreachable, lexer guarantees a Tkn::Word has only above 4 types of Tkns
         }
     }
     res
 }
 
-fn eval_envvar<'a>(expr: &'a str) -> String {
+fn eval_expansion<'a>(expr: &'a str) -> String {
     //`VAR`
     if expr.starts_with("`") && expr.ends_with("`") {
         let key = &expr[1..expr.len()-1];
         return get_env_var(key);
+    }
+    //$(<cmd subst>)
+    if expr.starts_with("$(") && expr.ends_with(')') {
+        let cmd_buf = &expr[1..]; //ignore the $
+        match eval_cmdsubst(cmd_buf) {
+            Ok(res) => return res,
+            Err(e) => eprintln!("Rush: {}", e),
+        }
+        return "".to_string();
     }
     //$VAR
     if expr.len() > 1 && expr.starts_with("$") { //$abc
@@ -464,9 +499,47 @@ fn eval_envvar<'a>(expr: &'a str) -> String {
     "$".to_string()
 } 
 
+fn eval_cmdsubst<'a>(expr_: &'a str) -> anyhow::Result<String> {
+    let debug = is_debug();
+    set_debug(false);
+
+    let mut expr = expr_.to_string();
+    expr.push_str("\n");
+    let mut lex = Tkn::lexer_with_extras(&expr, LexerState::new(&expr)).spanned();
+    let mut run_cmdsub = || -> anyhow::Result<String> {
+        if let Some((mut tokens, heredocs)) = lex_cmd_buf(&mut lex, &expr) {
+            let mut executables = Parser::new(&mut tokens, heredocs, &expr).parse()?;
+            if executables.len() > 1 {
+                anyhow::bail!("cmd substitution should only have 1 subshell");
+            }
+            let subshell_ast_node = &mut executables[0];
+            match &mut **subshell_ast_node {
+                AstNode::Subshell(subsh) => {
+                    let child: process::Child = subsh.spawn(Stdio::null(), Stdio::piped())?;
+                    let output = child.wait_with_output()?;
+                    if output.status.code().map_or(false, |code| code == 0) {
+                        let mut res = String::from_utf8(output.stdout)?;
+                        while res.ends_with('\n') || res.ends_with('\r') {
+                            //by POSIX standards, any trailing newline chars must be removed
+                            res.pop();
+                        }
+                        return Ok(res);
+                    }
+                    anyhow::bail!("couldn't evaluate command substitution {}", expr);
+                }
+                _ => anyhow::bail!("couldn't evaluate command substitution {}; failed to parse", expr),
+            }
+        }
+        anyhow::bail!("unreachable: Lexer error while parsing {}", expr)
+    };
+    let res = run_cmdsub();
+    set_debug(debug);
+    res
+}
+
 pub fn eval_dquote<'a>(tknspans: &'a [TknSpan], cmd_buf: &'a impl AsRef<str>) -> Cow<'a, str> {
-    //fast path: dquoted string has no expansions and doesn't have any '\' characters (nothing needs
-    //to be escaped), so minimize heap allocation via Cow::Borrowed
+    // fast path: dquoted string has no expansions and doesn't have any '\' characters (nothing needs
+    // to be escaped), so minimize heap allocation via Cow::Borrowed
     if tknspans.len() == 1 && tknspans[0].kind == Tkn::Literal && !get_token_at(&tknspans[0], cmd_buf).contains('\\') {
         return Cow::Borrowed(get_token_at(&tknspans[0], cmd_buf));
     }
@@ -476,7 +549,7 @@ pub fn eval_dquote<'a>(tknspans: &'a [TknSpan], cmd_buf: &'a impl AsRef<str>) ->
         let tkn_literal = get_token_at(tknspan, cmd_str);
         match &tknspan.kind {
             Tkn::Literal => res.push_str(&escape(tkn_literal)),
-            Tkn::Expansion => res.push_str(&eval_envvar(tkn_literal)),
+            Tkn::Expansion => res.push_str(&eval_expansion(tkn_literal)),
             _ => (),
         }
     }

@@ -80,7 +80,8 @@ fn run_test(cmd: &str, expected: String) -> anyhow::Result<()> {
     let (debug_output, output) = trim_debug_output(str::from_utf8(&res.stdout).unwrap_or(""));
     if output.trim() != expected.trim() {
         let stderr = str::from_utf8(&res.stderr).unwrap_or("");
-        anyhow::bail!("{}\n{}\n{}", stderr, debug_output, output);
+        println!("{}\n{}\n{}", stderr, debug_output, output);
+        assert_eq!(output.trim(), expected.trim()); //trigger assert to show comparison
     }
     println!("{}PASS{}\n", GREEN, NC);
     Ok(())
@@ -302,7 +303,16 @@ fn logicals() -> anyhow::Result<()> {
         (
             "false ||true && echo \"step 3\"&& false || echo \"final escape\"\n",
             "step 3\nfinal escape\n".to_string()
-        )
+        ),
+        //nonsense commands should fail
+        (
+            "asdf ||echo failed\n",
+            "failed".to_string(),
+        ),
+        (
+            "yuh && echo none\n",
+            no_output(),
+        ),
     ];
     for test in tests.into_iter() {
         run_test(test.0, test.1)?;
@@ -438,6 +448,71 @@ fn assignments() -> anyhow::Result<()> {
         run_test(test.0, test.1)?;
     }
     Ok(())
+}
+
+#[test]
+fn cmd_substitutions() -> anyhow::Result<()> {
+    let test_files = ["sub_in.txt", "sub_test.txt"];
+    let cleanup = || {
+        for file in &test_files {
+            let _ = std::fs::remove_file(file);
+        }
+    };
+    cleanup();
+
+    let tests = vec![
+        // Basic Command Substitution: Ensures simple commands wrapped in $() capture stdout.
+        (
+            "echo $(echo hello)\n",
+            "hello\n".to_string()
+        ),
+        // Variable Assignment from Substitution: Verifies storing command substitution output into a global variable.
+        (
+            "out=$(echo \"world\")\necho \"hello $out\"\n",
+            "hello world\n".to_string()
+        ),
+        // Subshell Scope Isolation: Confirms assignments made inside command substitutions do not leak into global state.
+        (
+            "echo $(foo=BAR; echo $foo);echo \"global:$foo\"\n",
+            "BAR\nglobal:\n".to_string()
+        ),
+        // Pipeline Inside Substitution: Ensures pipelines inside $() process and return expected output.
+        (
+            "echo $(echo \"apple\\nbanana\\ncherry\" | grep \"banana\")\n",
+            "banana\n".to_string()
+        ),
+        // Logical Operators Inside Substitution: Verifies short-circuiting logic (||, &&) executes properly inside $().
+        (
+            "echo $(false || echo \"fallback\")\n",
+            "fallback\n".to_string()
+        ),
+        // File Redirection Inside Substitution: Verifies reading from and writing to files inside $().
+        (
+            "echo \"subst_data\" > sub_in.txt && echo $(cat < sub_in.txt)\n",
+            "subst_data\n".to_string()
+        ),
+        // Nested Command Substitutions: Confirms command substitutions can be recursively nested.
+        (
+            "echo $(echo $(echo \"deep nested\"))\n",
+            "deep nested\n".to_string()
+        ),
+        // Complex AST Inside Substitution: Tests combining pipelines, redirections, and logical operators inside $().
+        (
+            "echo \"error log\" > sub_test.txt && echo $(grep \"error\" < sub_test.txt && echo \"parsed\")\n",
+            "error log\nparsed\n".to_string()
+        ),
+    ];
+
+    let mut res = Ok(());
+    for test in tests.into_iter() {
+        if let Err(e) = run_test(test.0, test.1) {
+            res = Err(anyhow::anyhow!(e));
+            break;
+        }
+    }
+
+    cleanup();
+    res
 }
 
 #[test]

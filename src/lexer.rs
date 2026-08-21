@@ -17,6 +17,7 @@ pub struct LexerState<'a> { //re-initialize to new instance on every lex of cmd_
                                   //requires creation of a new String to match the delimiter in body
     heredocs: Vec<(usize, usize)>, //(doc_start, doc_end)
 
+    subsh_matched: bool,
     pub syntax_err: Option<String>,
     pub expected_closer: Option<String>,
     pub continuation_for: Option<String>, //if cmd ends with &&, ||, |, or \, need to prompt user
@@ -28,6 +29,7 @@ impl<'a> LexerState<'a> {
             cmd_buf: cmd_buf,
             delimiters: VecDeque::new(),
             heredocs: Vec::new(),
+            subsh_matched: false,
             syntax_err: None,
             expected_closer: None,
             continuation_for: None,
@@ -84,10 +86,10 @@ pub enum Tkn {
     #[token("$", eval_callback)]
     Expansion, // Captures variables and command substitutions
 
-    #[token("(", bracket_callback)]
+    #[token("(", subsh_callback)]
     LParen,
 
-    #[token(")", bracket_callback)]
+    #[token(")")]
     RParen,
 
     #[token("\n", newline_handler)]
@@ -164,13 +166,11 @@ where T: Logos<'a, Extras = LexerState<'a>, Source = str> + Clone {
             }
             Ok(DQuoteTkn::Dollar) => {
                 let start = dq_lex.span().start;
-                if let Some(bytes_consumed) = parse_expansion(dq_lex.remainder(), &mut dq_lex.extras) {
-                    let end = start + 1 + bytes_consumed; // 1 for the `$`
-                    parts.push(TknSpan { kind: Tkn::Expansion, span: start..end });
-                    dq_lex.bump(bytes_consumed);
-                } else {
-                    return None; // Syntax error bubbled up in extras
-                }
+                if !parse_expansion(dq_lex.remainder(), &mut dq_lex) {
+                    return None
+                } 
+                let end = dq_lex.span().end;
+                parts.push(TknSpan { kind: Tkn::Expansion, span: start..end });
             }
             Ok(DQuoteTkn::Backtick) => {
                 let start = dq_lex.span().start;
@@ -247,45 +247,41 @@ where T: Logos<'a, Extras = LexerState<'a>, Source = str> + Clone {
 
 fn eval_callback<'a, T>(lex: &mut Lexer<'a, T>) -> bool 
 where T: Logos<'a, Extras = LexerState<'a>, Source = str> + Clone {
-    parse_expansion(lex.remainder(), &mut lex.extras).map_or(false, |bytes_consumed| {
-        lex.bump(bytes_consumed);
-        true
-    })
+    parse_expansion(lex.remainder(), lex)
 }
 
 /// Helper function to parse `${var}`, `$var`, or `$(cmd)` 
 /// Returns the number of string bytes consumed (excluding the initial `$`).
-fn parse_expansion(remainder: &str, lex_extras: &mut LexerState) -> Option<usize> {
+fn parse_expansion<'a, T>(remainder: &str, lex: &mut Lexer<'a, T>) -> bool
+where T: Logos<'a, Extras = LexerState<'a>, Source = str> + Clone {
     let mut chars = remainder.chars();
     let first = match chars.next() {
         Some(c) => c,
-        None => return Some(0), // naked '$' at EOF
+        None => return true, // naked '$' at EOF
     };
 
     match first {
         '{' => {
             if let Some(end_idx) = remainder.find('}') {
-                return Some(end_idx + 1);
+                lex.bump(end_idx + 1);
+                return true;
             } else {
-                lex_extras.expected_closer = Some("}".to_string());
-                return None;
+                lex.extras.expected_closer = Some("}".to_string());
+                return false;
             }
         }
         '(' => {
-            let mut depth = 1;
-            let mut bytes_consumed = 1;
-            for c in chars {
-                bytes_consumed += c.len_utf8();
-                if c == '(' { depth += 1; }
-                else if c == ')' {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(bytes_consumed);
-                    }
-                }
+            if chars.next().is_none() { 
+                lex.extras.expected_closer = Some("$)".to_string());
+                return false;
             }
-            lex_extras.expected_closer = Some("$)".to_string());
-            return None;
+            if let Some(bytes_consumed) = parse_parentheses(&remainder[1..]) {
+                //starting from index 1 is safe because of the chars check above
+                lex.bump(bytes_consumed + 1);
+                return true;
+            }
+            lex.extras.expected_closer = Some("$)".to_string());
+            return false;
         }
         c if c.is_alphabetic() || c == '_' => {
             let mut bytes_consumed = c.len_utf8();
@@ -296,14 +292,16 @@ fn parse_expansion(remainder: &str, lex_extras: &mut LexerState) -> Option<usize
                     break;
                 }
             }
-            return Some(bytes_consumed)
+            lex.bump(bytes_consumed); 
+            return true;
         }
         '?' | '*' | '@' | '#' | '$' | '0'..='9' => {
-            return Some(first.len_utf8());
+            lex.bump(first.len_utf8());
+            return true;
         }
         _ => {
+            return true;
             // Un-expandable sequence, treat as literal "$"
-            return Some(0)
         }
     }
 }
@@ -387,21 +385,30 @@ fn heredoc_callback(lex: &mut Lexer<Tkn>) -> bool {
     success                                        
 }
 
-fn bracket_callback(lex: &mut Lexer<Tkn>) -> bool {
-    let bracket = lex.slice();
-    let remainder = lex.remainder();
-    let closer = match bracket {
-        "(" => ")",
-        "[" => "]",
-        "{" => "}",
-        _ => "", //unreachable
-    };
-    if remainder.find(closer).is_none() {
-        lex.extras.expected_closer = Some(closer.to_string());
-        return false;
+fn subsh_callback(lex: &mut Lexer<Tkn>) -> bool {
+    if lex.extras.subsh_matched { 
+        return true; 
+    } else {
+        lex.extras.subsh_matched = parse_parentheses(lex.remainder()).is_some();
     }
-    true
+    lex.extras.subsh_matched
 }
+
+fn parse_parentheses<'a>(remainder: &'a str) -> Option<usize> {
+    let mut depth: usize = 1;
+    let mut bytes_consumed = 0;
+    for c in remainder.chars() {
+        bytes_consumed += c.len_utf8();
+        if c == '(' { depth += 1; }
+        if c == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(bytes_consumed);
+            }
+        }
+    }
+    None
+} 
 
 #[derive(Logos, Debug, PartialEq, Clone)]
 #[logos(extras = LexerState<'s>)]

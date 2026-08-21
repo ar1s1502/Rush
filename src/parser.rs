@@ -180,54 +180,54 @@ impl<'a> Parser<'a> {
                 }
                 /* program delimiters */
                 Tkn::Newline | Tkn::Semicolon | Tkn::CmdOr | Tkn::CmdAnd | Tkn::RParen | Tkn::Pipe => {
-                    if args.is_empty() && inner_ast_.is_none() && env_vars.is_empty() { 
-                        return Err(anyhow!("Syntax Err: empty args"));
-                    }
-                    if inner_ast_.is_some() && !env_vars.is_empty() {
-                        anyhow::bail!("Syntax Err: inline assignment outside of subshell");
-                    }
-                    //if inner_ast is some, then we built a subshell program
-                    if let Some(inner_ast) = inner_ast_ {
-                        if !env_vars.is_empty() {
-                            anyhow::bail!("Syntax Err: invalid assignment");
-                        }
-                        return Ok(Box::new(AstNode::Subshell(Subsh {
-                            cmd_buf: Cow::Borrowed(self.cmd_buf),
-                            inner_ast,
-                            redirect_ins,
-                            redirect_outs,
-                        })));
-                    }
-                    //if assignments, but no args, then put the assignments in global shell ENV_VARS map 
-                    if !env_vars.is_empty() && args.is_empty() {
-                        return Ok(Box::new(AstNode::Assignments{ 
-                            assignments: env_vars,
-                            cmd_buf: Cow::Borrowed(self.cmd_buf),
-                        }));
-                    }
-                    //if args[0] is a builtin command, then return astnode::builtin
-                    if get_builtins().get(eval_word(&args[0], self.cmd_buf).as_str()).is_some() {
-                        return Ok(Box::new(AstNode::Builtin(Builtin {
-                            args,
-                            cmd_buf: Cow::Borrowed(self.cmd_buf), //cheap b/c just cloning the pointer 
-                            redirect_ins,
-                            redirect_outs,
-                        })));
-                    }
-                    //else we have to look up in $PATH
-                    return Ok(Box::new(AstNode::Prog(ChildPr {
-                        args,
-                        cmd_buf: Cow::Borrowed(self.cmd_buf),
-                        redirect_ins,
-                        redirect_outs,
-                        env_vars,
-                    })));
+                    break;
                 },
                 Tkn::Space => (), //ignore spaces
                 _ => return Err(anyhow!("Syntax Err: unexpected tkn in expression")),
             }
         }
-        Err(anyhow!("Parse error: no tkns"))
+        if args.is_empty() && inner_ast_.is_none() && env_vars.is_empty() { 
+            return Err(anyhow!("Syntax Err: empty args"));
+        }
+        if inner_ast_.is_some() && !env_vars.is_empty() {
+            anyhow::bail!("Syntax Err: inline assignment outside of subshell");
+        }
+        //if inner_ast is some, then we built a subshell program
+        if let Some(inner_ast) = inner_ast_ {
+            if !env_vars.is_empty() {
+                anyhow::bail!("Syntax Err: invalid assignment");
+            }
+            return Ok(Box::new(AstNode::Subshell(Subsh {
+                cmd_buf: Cow::Borrowed(self.cmd_buf),
+                inner_ast,
+                redirect_ins,
+                redirect_outs,
+            })));
+        }
+        //if assignments, but no args, then put the assignments in global shell ENV_VARS map 
+        if !env_vars.is_empty() && args.is_empty() {
+            return Ok(Box::new(AstNode::Assignments{ 
+                assignments: env_vars,
+                cmd_buf: Cow::Borrowed(self.cmd_buf),
+            }));
+        }
+        //if args[0] is a builtin command, then return astnode::builtin
+        if get_builtins().get(eval_word(&args[0], self.cmd_buf).as_str()).is_some() {
+            return Ok(Box::new(AstNode::Builtin(Builtin {
+                args,
+                cmd_buf: Cow::Borrowed(self.cmd_buf), //cheap b/c just cloning the pointer 
+                redirect_ins,
+                redirect_outs,
+            })));
+        }
+        //else we have to look up in $PATH
+        return Ok(Box::new(AstNode::Prog(ChildPr {
+            args,
+            cmd_buf: Cow::Borrowed(self.cmd_buf),
+            redirect_ins,
+            redirect_outs,
+            env_vars,
+        })));
     }
 
     fn build_subshell(&mut self) -> anyhow::Result<Vec<Box<AstNode<'a>>>> {
@@ -267,17 +267,18 @@ impl<'a> Parser<'a> {
                 //this shouldn't be reachable but just in case
                 return Err(anyhow!("Syntax Err"));
             }
-            let tkn = self.cur_tkn.as_ref().unwrap();
-            match tkn.kind {
+            let tkn_kind = self.cur_tkn.as_ref().unwrap().kind.clone(); 
+            match tkn_kind {
                 Tkn::Newline | Tkn::Semicolon | Tkn::RParen => return Ok(node),
                 Tkn::CmdOr | Tkn::CmdAnd => {
+                    self.ignore_next_program_delims();
                     node = Box::new(AstNode::Logical {
                         lhs: node,
-                        operator: tkn.kind.clone(),
+                        operator: tkn_kind,
                         rhs: self.build_pipeline()?,
                     });
                 },
-                _ => return Err(anyhow!("Syntax Err in build_ast\nexpected \\n, ;, ||, or && but got '{}'", tkn.kind)),
+                _ => return Err(anyhow!("Syntax Err: expected \\n, ;, ||, or && but got '{}'", tkn_kind)),
             }
         }
     }

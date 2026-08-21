@@ -40,8 +40,11 @@ thread_local! { //create these in thread local memory so that it can be accessed
     pub static ENV_VARS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
 }
 
+pub fn set_debug(debug: bool) {
+    SHELL_STATE.with_borrow_mut(|s| s.debug = debug);
+}
 pub fn is_debug() -> bool {
-    SHELL_STATE.with_borrow(|s| s.debug)
+    SHELL_STATE.with_borrow(|s| s.debug) 
 }
 fn is_tty() -> bool {
     SHELL_STATE.with_borrow(|s| s.tty)
@@ -75,20 +78,7 @@ fn print_cmd<'a> (tkns: &'a [TknSpan], heredocs: &VecDeque<&'a str>) {
     }
 }
 
-fn main() -> rustyline::Result<()> {
-    //check if this process is running as a subshell
-    //TODO: add cryptography to ensure that the subshell really spawned by shell
-    if let Ok(serialized_ast) = env::var(AS_SUBSHELL) {
-        let parsed_ast = serde_json::from_str(&serialized_ast).unwrap_or_else(|_| {
-            process::exit(1);
-        });
-        match execute_ast(parsed_ast) {
-            Ok(exit_code) => process::exit(exit_code),
-            Err(_) => process::exit(1),
-        }
-    }
-    
-    /* Flags */
+fn parse_flags() {
     for (i, arg) in env::args().enumerate() {
         if i == 0 { continue; }//skip the program name 
         match arg.as_ref() {
@@ -99,6 +89,24 @@ fn main() -> rustyline::Result<()> {
             },
         }
     }
+}
+
+fn main() -> rustyline::Result<()> {
+    //check if this process is running as a subshell
+    //TODO: add cryptography to ensure that the subshell really spawned by shell
+    if let Ok(serialized_ast) = env::var(AS_SUBSHELL) {
+        let parsed_ast = serde_json::from_str(&serialized_ast).unwrap_or_else(|_| {
+            process::exit(1);
+        });
+        parse_flags();
+        match execute_ast(parsed_ast) {
+            Ok(exit_code) => process::exit(exit_code),
+            Err(_) => process::exit(1),
+        }
+    }
+    
+    /* Flags */
+    parse_flags();
 
     //this is running in the foreground, do REPL 
     send_osc133(CMD_OUTPUT_START);
@@ -207,7 +215,7 @@ fn set_expected_closer_prompt(prompt: &mut String, closer: &str) {
         "`" => *prompt = String::from("bquote> "),
         "\"" => *prompt = String::from("dquote> "),
         ")" => *prompt = String::from("subsh> "),
-        "$)" => *prompt = String::from("CmdSubs> "),
+        "$)" => *prompt = String::from("cmdsubst> "),
         _ => *prompt = format!("missing {} for heredoc> ", closer),
     }
     send_osc133(&format!("{};{}", PROMPT_START, prompt))
